@@ -58,9 +58,6 @@ select = [
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 
-[tool.setuptools.package-data]
-llm_cost = ["prices.yaml"]
-
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"

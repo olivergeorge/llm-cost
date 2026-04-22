@@ -517,7 +517,9 @@ def test_summarise_honours_custom_prices(db):
         cost_usd=None,
         datetime_utc="2026-04-20T00:00:00+00:00",
     )
-    s = summarise(db, prices={"my-local-model": Price(0.01, 0.02)})
+    # Per-token costs: 0.01 / 1M input, 0.02 / 1M output (matches the
+    # LiteLLM-aligned schema the loader now expects).
+    s = summarise(db, prices={"my-local-model": Price(0.01 / 1_000_000, 0.02 / 1_000_000)})
     assert s.rows[0].priced_cost_usd == pytest.approx(0.01)
 
 

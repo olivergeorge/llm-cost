@@ -191,8 +191,10 @@ def _render_table(summary: Summary, label: str) -> str:
         out.append("")
         out.append(f"Note: no price for: {unpriced}")
         out.append(
-            "      Override with --prices PATH or set LLM_COST_PRICES; "
-            "tokens are counted but cost shown as $0."
+            "      Run `llm cost refresh-prices` to download LiteLLM's catalog,"
+        )
+        out.append(
+            "      or point --prices PATH / LLM_COST_PRICES at your own file."
         )
     return "\n".join(out)
 
@@ -685,12 +687,43 @@ def register_commands(cli: click.Group) -> None:
         """List models with known prices in the active price table."""
         table = load_prices(prices_path) if prices_path else default_prices()
         if not table:
-            click.echo("No prices loaded.")
+            click.echo(
+                "No prices loaded. Run `llm cost refresh-prices` to download "
+                "LiteLLM's catalog, or point --prices PATH at your own file."
+            )
             return
         width = max(len(k) for k in table)
+        # Prices are stored per-token; re-scale to $/1M for display since
+        # that's how providers publish their rates and how humans think.
         click.echo(f"{'model'.ljust(width)}  input $/1M  output $/1M")
         for name in sorted(table):
             p = table[name]
+            in_per_m = p.input_cost_per_token * 1_000_000
+            out_per_m = p.output_cost_per_token * 1_000_000
             click.echo(
-                f"{name.ljust(width)}  {p.input_per_mtok:>10.3f}  {p.output_per_mtok:>11.3f}"
+                f"{name.ljust(width)}  {in_per_m:>10.3f}  {out_per_m:>11.3f}"
             )
+
+    @cost_group.command(name="refresh-prices")
+    @click.option(
+        "--url",
+        default=None,
+        help="Override the source URL (defaults to LiteLLM's catalog).",
+    )
+    def cost_refresh_prices_cmd(url: str | None) -> None:
+        """Download LiteLLM's model prices catalog to the user cache.
+
+        After a refresh, `llm cost` commands pick up the downloaded
+        catalog automatically — no need to pass --prices. Remove
+        ~/.config/llm-cost/prices.json (or the equivalent on your
+        platform) to revert to the bundled snapshot.
+        """
+        from .pricing import LITELLM_PRICES_URL, refresh_prices, load_prices
+
+        source = url or LITELLM_PRICES_URL
+        try:
+            dest = refresh_prices(source)
+        except Exception as exc:  # network, JSON decode, or disk error
+            raise click.ClickException(f"Refresh failed: {exc}") from exc
+        table = load_prices(dest)
+        click.echo(f"Downloaded {len(table):,} model prices to {dest}")

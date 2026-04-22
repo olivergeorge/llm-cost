@@ -1,22 +1,56 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from llm_cost.pricing import Price, _canonical, default_prices, load_prices, resolve
+import pytest
+
+from llm_cost import pricing
+from llm_cost.pricing import (
+    Price,
+    _canonical,
+    default_prices,
+    load_prices,
+    refresh_prices,
+    resolve,
+)
 
 
-def test_bundled_prices_load():
-    table = default_prices()
-    assert "claude-opus-4-6" in table
-    assert table["claude-opus-4-6"] == Price(5.0, 25.0)
+# Per-million USD is how providers publish rates — convert once and keep
+# tests readable at the call site.
+def _m(input_per_m: float, output_per_m: float) -> Price:
+    return Price(input_per_m / 1_000_000, output_per_m / 1_000_000)
 
 
-def test_price_cost_round_trip():
-    p = Price(2.5, 15.0)
-    assert p.cost(1_000_000, 0) == 2.5
-    assert p.cost(0, 1_000_000) == 15.0
-    # Mixed, fractional tokens
-    assert p.cost(500_000, 200_000) == 2.5 * 0.5 + 15.0 * 0.2
+@pytest.fixture(autouse=True)
+def _empty_user_cache(_test_price_cache):
+    """Start each pricing test with an empty cache.
+
+    The repo-level ``conftest`` seeds a populated cache so CLI/inline
+    tests can assert on priced totals. Pricing tests, in contrast,
+    exercise the cache-population/absence paths directly, so they
+    want a blank slate. We wipe the file the conftest wrote and let
+    individual tests re-populate via ``refresh_prices`` or direct
+    write.
+    """
+    if _test_price_cache.exists():
+        _test_price_cache.unlink()
+    default_prices.cache_clear()
+    yield _test_price_cache
+    default_prices.cache_clear()
+
+
+def test_default_prices_empty_without_cache():
+    """No cache, no bundle → no prices. Users run refresh-prices to populate."""
+    assert default_prices() == {}
+
+
+def test_price_cost_multiplies_per_token():
+    # $2.50 per 1M input, $15 per 1M output → 1M input = $2.50 exactly.
+    p = _m(2.5, 15.0)
+    assert p.cost(1_000_000, 0) == pytest.approx(2.5)
+    assert p.cost(0, 1_000_000) == pytest.approx(15.0)
+    assert p.cost(500_000, 200_000) == pytest.approx(2.5 * 0.5 + 15.0 * 0.2)
 
 
 def test_canonical_strips_provider_prefix_and_variants():
@@ -30,81 +64,145 @@ def test_canonical_strips_provider_prefix_and_variants():
     assert _canonical("mistral/mistral-small-latest") == "mistral-small"
 
 
-def test_bundled_prices_cover_newly_added_models():
-    """Sanity-check a representative slice of the price table additions."""
-    table = default_prices()
-    assert resolve("gpt-5", table=table) == Price(1.25, 10.0)
-    assert resolve("gpt-5-nano", table=table) == Price(0.05, 0.4)
-    assert resolve("gpt-4o", table=table) == Price(2.5, 10.0)
-    assert resolve("o3-pro", table=table) == Price(20.0, 80.0)
-    assert resolve("codex-mini", table=table) == Price(1.5, 6.0)
-    assert resolve("anthropic/claude-opus-4-5-20251101", table=table) == Price(5.0, 25.0)
-    assert resolve("anthropic/claude-sonnet-4-5", table=table) == Price(3.0, 15.0)
-    assert resolve("anthropic/claude-opus-4-0", table=table) == Price(15.0, 75.0)
-    # Preview snapshots that don't match the 8-digit date regex get explicit entries.
-    assert resolve("gemini/gemini-2.5-flash-preview-05-20", table=table) == Price(0.3, 2.5)
-    assert resolve("gemini/gemini-2.5-flash-lite-preview-09-2025", table=table) == Price(0.1, 0.4)
-    assert resolve("gemini/gemini-2.5-pro-preview-06-05", table=table) == Price(1.25, 10.0)
-    # -latest alias falls through to the bare canonical.
-    assert resolve("gemini/gemini-flash-latest", table=table) == Price(0.3, 2.5)
-    assert resolve("gemini/gemini-flash-lite-latest", table=table) == Price(0.1, 0.4)
-    # Mistral picks up via the new provider prefix.
-    assert resolve("mistral/mistral-tiny", table=table) == Price(0.25, 0.25)
-    assert resolve("mistral/devstral-small", table=table) == Price(0.1, 0.3)
-    # Local / free models are priced explicitly at $0.
-    assert resolve("gemma4:26b", table=table) == Price(0.0, 0.0)
-
-
 def test_resolve_prefers_resolved_model_when_raw_is_ambiguous():
-    # Raw name is an alias llm uses internally; resolved is the real model.
-    price = resolve("gemini/gemini-flash-latest", "gemini-3-flash-preview")
-    assert price == Price(0.5, 3.0)
+    """Raw name may be an llm alias; prefer the resolver's provider-resolved name."""
+    table = {
+        "gemini-flash": _m(0.3, 2.5),
+        "gemini-3-flash-preview": _m(0.5, 3.0),
+    }
+    price = resolve(
+        "gemini/gemini-flash-latest", "gemini-3-flash-preview", table=table
+    )
+    assert price == _m(0.5, 3.0)
 
 
 def test_resolve_falls_back_to_raw_when_resolved_missing():
-    price = resolve("anthropic/claude-opus-4-6", None)
-    assert price == Price(5.0, 25.0)
+    table = {"claude-opus-4-6": _m(5.0, 25.0)}
+    price = resolve("anthropic/claude-opus-4-6", None, table=table)
+    assert price == _m(5.0, 25.0)
 
 
 def test_resolve_returns_none_for_unknown():
-    assert resolve("totally-made-up-model") is None
+    assert resolve("totally-made-up-model", table={}) is None
 
 
-def test_load_prices_flat_shape(tmp_path: Path):
+def test_load_prices_flat_litellm_shape(tmp_path: Path):
+    """The loader reads the LiteLLM field names straight off disk."""
     path = tmp_path / "p.yaml"
     path.write_text(
         """
         my-model:
-          input: 1.5
-          output: 7.0
+          input_cost_per_token: 1.5e-6
+          output_cost_per_token: 7e-6
         partial-model:
-          input: 2.0
+          input_cost_per_token: 2e-6
         """
     )
     table = load_prices(path)
-    assert table == {"my-model": Price(1.5, 7.0)}
+    # Partial entries (missing one side of the pair) are skipped.
+    assert table == {"my-model": _m(1.5, 7.0)}
 
 
-def test_load_prices_wrapped_shape(tmp_path: Path):
-    path = tmp_path / "models.yaml"
+def test_load_prices_reads_litellm_json_verbatim(tmp_path: Path):
+    """yaml.safe_load handles JSON, so a LiteLLM file works as-is."""
+    path = tmp_path / "litellm.json"
     path.write_text(
-        """
-        models:
-          anthropic/claude-opus-4-6:
-            input_cost_per_1m: 5.0
-            output_cost_per_1m: 25.0
-          gemma4:26b:
-            input_cost_per_1m: 0
-            output_cost_per_1m: 0
-        """
+        json.dumps(
+            {
+                "sample_spec": {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0},
+                "gpt-4o": {
+                    "input_cost_per_token": 2.5e-6,
+                    "output_cost_per_token": 1e-5,
+                    "litellm_provider": "openai",
+                },
+            }
+        )
     )
     table = load_prices(path)
-    assert table["claude-opus-4-6"] == Price(5.0, 25.0)
-    assert table["gemma4:26b"] == Price(0.0, 0.0)
+    # sample_spec is skipped; extra metadata fields are ignored.
+    assert "sample_spec" not in table
+    assert table["gpt-4o"] == _m(2.5, 10.0)
 
 
 def test_resolve_honours_custom_table():
-    custom = {"my-model": Price(99.0, 101.0)}
-    assert resolve("my-model", None, table=custom) == Price(99.0, 101.0)
-    # Default-table hit doesn't leak when a custom table is passed
-    assert resolve("claude-opus-4-6", None, table=custom) is None
+    custom = {"my-model": _m(99.0, 101.0)}
+    assert resolve("my-model", None, table=custom) == _m(99.0, 101.0)
+
+
+def test_refresh_prices_writes_user_cache(_empty_user_cache, monkeypatch):
+    """`refresh_prices` downloads the catalog and invalidates the cache."""
+    cache_path = _empty_user_cache
+    payload = json.dumps(
+        {
+            "gpt-4o": {
+                "input_cost_per_token": 2.5e-6,
+                "output_cost_per_token": 1e-5,
+            }
+        }
+    ).encode()
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return payload
+
+    monkeypatch.setattr(pricing, "urlopen", lambda req, timeout=30.0: _FakeResp())
+
+    dest = refresh_prices()
+    assert dest == cache_path
+    assert cache_path.read_bytes() == payload
+    # After refresh the loader sees the downloaded entry.
+    assert load_prices(cache_path) == {"gpt-4o": _m(2.5, 10.0)}
+
+
+def test_default_prices_reads_user_cache(_empty_user_cache):
+    """Once a cache file exists, default_prices() uses it automatically."""
+    cache_path = _empty_user_cache
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "claude-opus-4-6": {
+                    "input_cost_per_token": 5e-6,
+                    "output_cost_per_token": 2.5e-5,
+                }
+            }
+        )
+    )
+    default_prices.cache_clear()
+    table = default_prices()
+    assert table == {"claude-opus-4-6": _m(5.0, 25.0)}
+
+
+def test_refresh_prices_rejects_invalid_json(_empty_user_cache, monkeypatch):
+    """A bad download must not clobber an existing good cache."""
+    cache_path = _empty_user_cache
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {"keep": {"input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}}
+        )
+    )
+    original = cache_path.read_bytes()
+
+    class _BadResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return b"<!DOCTYPE html><html>rate limited</html>"
+
+    monkeypatch.setattr(pricing, "urlopen", lambda req, timeout=30.0: _BadResp())
+
+    with pytest.raises(json.JSONDecodeError):
+        refresh_prices()
+    # Previous cache intact.
+    assert cache_path.read_bytes() == original

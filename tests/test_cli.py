@@ -145,11 +145,13 @@ def test_cost_since_until(cli, seeded_db: Path):
 
 def test_cost_prices_override(cli, seeded_db: Path, tmp_path: Path):
     prices = tmp_path / "override.yaml"
+    # $100/M input, $200/M output expressed in the per-token units the
+    # LiteLLM-aligned loader expects.
     prices.write_text(
         """
         made-up-model:
-          input: 100.0
-          output: 200.0
+          input_cost_per_token: 100e-6
+          output_cost_per_token: 200e-6
         """
     )
     runner = CliRunner()

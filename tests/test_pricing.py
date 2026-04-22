@@ -26,6 +26,33 @@ def test_canonical_strips_provider_prefix_and_variants():
     assert _canonical("gemini/gemini-3.1-pro-preview-customtools") == "gemini-3.1-pro-preview"
     assert _canonical("gemini/gemini-flash-latest") == "gemini-flash"
     assert _canonical("anthropic/claude-haiku-4-5-20251001") == "claude-haiku-4-5"
+    assert _canonical("mistral/mistral-tiny") == "mistral-tiny"
+    assert _canonical("mistral/mistral-small-latest") == "mistral-small"
+
+
+def test_bundled_prices_cover_newly_added_models():
+    """Sanity-check a representative slice of the price table additions."""
+    table = default_prices()
+    assert resolve("gpt-5", table=table) == Price(1.25, 10.0)
+    assert resolve("gpt-5-nano", table=table) == Price(0.05, 0.4)
+    assert resolve("gpt-4o", table=table) == Price(2.5, 10.0)
+    assert resolve("o3-pro", table=table) == Price(20.0, 80.0)
+    assert resolve("codex-mini", table=table) == Price(1.5, 6.0)
+    assert resolve("anthropic/claude-opus-4-5-20251101", table=table) == Price(5.0, 25.0)
+    assert resolve("anthropic/claude-sonnet-4-5", table=table) == Price(3.0, 15.0)
+    assert resolve("anthropic/claude-opus-4-0", table=table) == Price(15.0, 75.0)
+    # Preview snapshots that don't match the 8-digit date regex get explicit entries.
+    assert resolve("gemini/gemini-2.5-flash-preview-05-20", table=table) == Price(0.3, 2.5)
+    assert resolve("gemini/gemini-2.5-flash-lite-preview-09-2025", table=table) == Price(0.1, 0.4)
+    assert resolve("gemini/gemini-2.5-pro-preview-06-05", table=table) == Price(1.25, 10.0)
+    # -latest alias falls through to the bare canonical.
+    assert resolve("gemini/gemini-flash-latest", table=table) == Price(0.3, 2.5)
+    assert resolve("gemini/gemini-flash-lite-latest", table=table) == Price(0.1, 0.4)
+    # Mistral picks up via the new provider prefix.
+    assert resolve("mistral/mistral-tiny", table=table) == Price(0.25, 0.25)
+    assert resolve("mistral/devstral-small", table=table) == Price(0.1, 0.3)
+    # Local / free models are priced explicitly at $0.
+    assert resolve("gemma4:26b", table=table) == Price(0.0, 0.0)
 
 
 def test_resolve_prefers_resolved_model_when_raw_is_ambiguous():

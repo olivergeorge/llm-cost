@@ -45,6 +45,7 @@ _PROVIDER_PREFIXES = (
     "anthropic/",
     "openai/",
     "google/",
+    "mistral/",
 )
 _VARIANT_SUFFIXES = ("-customtools", "-thinking", "-latest")
 _DATE_SUFFIX_RE = re.compile(r"-\d{8}$")

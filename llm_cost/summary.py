@@ -8,13 +8,13 @@ from datetime import date, datetime, time, timedelta, timezone, tzinfo
 
 import sqlite_utils
 
-from .pricing import Price, default_prices, resolve
+from .pricing import Price, _canonical, default_prices, resolve
 
 
 @dataclass(frozen=True)
 class ModelUsage:
-    model: str
-    resolved_model: str | None
+    model: str  # canonical display name (post alias resolution)
+    variants: tuple[tuple[str, str | None], ...]  # raw (model, resolved_model) pairs that rolled up
     response_count: int
     input_tokens: int
     output_tokens: int
@@ -74,20 +74,56 @@ def local_day_bounds(day: date, tz: tzinfo | None = None) -> tuple[datetime, dat
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
+def canonical_key(
+    model: str,
+    resolved_model: str | None = None,
+    alias_map: dict[str, str] | None = None,
+) -> str:
+    """Derive a stable grouping key for a logged (model, resolved_model) pair.
+
+    Preference order:
+      1. Alias-map hit on ``resolved_model`` — returns the Model's
+         ``.model_id`` so e.g. ``claude-haiku-4.5`` collapses to
+         ``anthropic/claude-haiku-4-5-20251001``.
+      2. Alias-map hit on ``model`` — same.
+      3. ``_canonical(resolved_model)`` when resolved is set — strips
+         provider prefix + date/variant suffixes for retired models
+         that are no longer in the alias map.
+      4. ``_canonical(model)``.
+
+    Keys returned from (1)/(2) are full provider-prefixed model ids;
+    keys from (3)/(4) are the stripped shorter form. Both flow into
+    ``pricing.resolve`` which applies ``_canonical`` internally, so
+    either shape hits the same price-table row.
+    """
+    amap = alias_map or {}
+    for candidate in (resolved_model, model):
+        if candidate and candidate in amap:
+            return amap[candidate]
+    if resolved_model:
+        return _canonical(resolved_model)
+    return _canonical(model)
+
+
 def summarise(
     db: sqlite_utils.Database,
     since: datetime | None = None,
     until: datetime | None = None,
     model_glob: str | None = None,
     prices: dict[str, Price] | None = None,
+    alias_map: dict[str, str] | None = None,
 ) -> Summary:
     """Aggregate ``responses`` into per-model token/cost rows.
 
     - ``since`` / ``until`` are UTC half-open bounds (``since <= t < until``).
       Pass naive ``datetime``s at your peril — use ``local_day_bounds``
       or construct timezone-aware values.
-    - ``model_glob`` is a SQL LIKE pattern applied to ``model``.
-    - ``prices`` overrides ``pricing.DEFAULT_PRICES``.
+    - ``model_glob`` is a SQL LIKE pattern applied to the raw ``model`` column.
+    - ``prices`` overrides the bundled price table.
+    - ``alias_map`` maps alias/model-name to canonical ``model_id`` —
+      typically ``{name: m.model_id for name, m in llm.get_model_aliases().items()}``.
+      When None or empty, folding falls back to the prefix/suffix
+      stripping heuristic only.
     """
     table = prices if prices is not None else default_prices()
 
@@ -116,31 +152,55 @@ def summarise(
         FROM responses
         {where}
         GROUP BY model, resolved_model
-        ORDER BY (COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0)) DESC
     """
 
-    rows: list[ModelUsage] = []
+    # Fold SQL rows into canonical groups in Python — the alias map lives
+    # in llm's runtime registry, not the DB, so we can't express this in SQL.
+    groups: dict[str, dict] = {}
     for row in db.execute(sql, params):
         model, resolved, count, inp, outp, logged_cost = row
-        price = resolve(model, resolved or None, table)
+        resolved_opt = resolved or None
+        key = canonical_key(model, resolved_opt, alias_map)
+        g = groups.setdefault(
+            key,
+            {
+                "variants": set(),
+                "count": 0,
+                "input": 0,
+                "output": 0,
+                "logged": 0.0,
+            },
+        )
+        g["variants"].add((model, resolved_opt))
+        g["count"] += int(count)
+        g["input"] += int(inp)
+        g["output"] += int(outp)
+        g["logged"] += float(logged_cost)
+
+    rows: list[ModelUsage] = []
+    for key, g in groups.items():
+        price = resolve(key, None, table)
         if price is not None:
-            priced_cost = price.cost(int(inp), int(outp))
+            priced_cost = price.cost(g["input"], g["output"])
             priced = True
         else:
             priced_cost = 0.0
             priced = False
         rows.append(
             ModelUsage(
-                model=model,
-                resolved_model=resolved or None,
-                response_count=int(count),
-                input_tokens=int(inp),
-                output_tokens=int(outp),
-                logged_cost_usd=float(logged_cost),
+                model=key,
+                variants=tuple(sorted(g["variants"], key=lambda v: (v[0], v[1] or ""))),
+                response_count=g["count"],
+                input_tokens=g["input"],
+                output_tokens=g["output"],
+                logged_cost_usd=g["logged"],
                 priced_cost_usd=priced_cost,
                 priced=priced,
             )
         )
+
+    # Highest token volume first, matching the old SQL ORDER BY.
+    rows.sort(key=lambda r: r.input_tokens + r.output_tokens, reverse=True)
 
     return Summary(since_utc=since, until_utc=until, rows=tuple(rows))
 
@@ -159,13 +219,12 @@ def _iso(dt: datetime) -> str:
 
 
 def models_without_prices(summary: Summary) -> Iterable[str]:
-    """Yield distinct model names that had no price match and no logged cost."""
+    """Yield canonical names that had no price match and no logged cost."""
     seen: set[str] = set()
     for row in summary.rows:
         if row.priced or row.logged_cost_usd > 0:
             continue
-        key = row.resolved_model or row.model
-        if key in seen:
+        if row.model in seen:
             continue
-        seen.add(key)
-        yield key
+        seen.add(row.model)
+        yield row.model

@@ -68,6 +68,19 @@ def _load_price_table(prices_path: Path | None) -> dict | None:
     return None
 
 
+def _alias_map() -> dict[str, str]:
+    """Snapshot of llm's alias → canonical ``model_id`` registry.
+
+    Used to collapse historical variants (e.g. ``gemini-3-flash-preview``,
+    ``gemini/gemini-3-flash-preview``, and the ``gemini-flash-latest``
+    alias) into a single grouped row.
+    """
+    try:
+        return {name: m.model_id for name, m in llm.get_model_aliases().items()}
+    except Exception:  # pragma: no cover - defensive against llm API drift
+        return {}
+
+
 def _report(
     since,
     until,
@@ -79,7 +92,14 @@ def _report(
 ) -> None:
     prices = _load_price_table(prices_path)
     db = sqlite_utils.Database(str(db_path or _logs_db_path()))
-    summary = summarise(db, since=since, until=until, model_glob=model_glob, prices=prices)
+    summary = summarise(
+        db,
+        since=since,
+        until=until,
+        model_glob=model_glob,
+        prices=prices,
+        alias_map=_alias_map(),
+    )
     if as_json:
         click.echo(_render_json(summary, label))
     else:
@@ -101,7 +121,6 @@ def _render_table(summary: Summary, label: str) -> str:
     headers = ("model", "resps", "in", "out", "cost (USD)", "source")
     rows = []
     for row in summary.rows:
-        display_model = row.resolved_model or row.model
         if row.logged_cost_usd > 0:
             source = "logged"
         elif row.priced:
@@ -110,7 +129,7 @@ def _render_table(summary: Summary, label: str) -> str:
             source = "unpriced"
         rows.append(
             (
-                display_model,
+                row.model,
                 str(row.response_count),
                 _format_tokens(row.input_tokens),
                 _format_tokens(row.output_tokens),
@@ -168,7 +187,10 @@ def _render_json(summary: Summary, label: str) -> str:
         "rows": [
             {
                 "model": r.model,
-                "resolved_model": r.resolved_model,
+                "variants": [
+                    {"model": raw, "resolved_model": resolved}
+                    for raw, resolved in r.variants
+                ],
                 "responses": r.response_count,
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,

@@ -109,7 +109,12 @@ def test_cost_model_glob_filters(cli, seeded_db: Path):
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert len(payload["rows"]) == 1
-    assert payload["rows"][0]["model"] == "gemini/gemini-3-flash-preview"
+    # Without an injected alias map (CLI test uses an empty click group),
+    # canonical_key falls back to the prefix-stripping heuristic.
+    assert payload["rows"][0]["model"] == "gemini-3-flash-preview"
+    assert payload["rows"][0]["variants"] == [
+        {"model": "gemini/gemini-3-flash-preview", "resolved_model": "gemini-3-flash-preview"}
+    ]
 
 
 def test_cost_since_until(cli, seeded_db: Path):

@@ -8,6 +8,7 @@ import sqlite_utils
 
 from llm_cost.pricing import Price
 from llm_cost.summary import (
+    canonical_key,
     local_day_bounds,
     models_without_prices,
     summarise,
@@ -163,7 +164,87 @@ def test_summarise_applies_model_glob(db):
     )
     s = summarise(db, model_glob="gemini/%")
     assert len(s.rows) == 1
-    assert s.rows[0].model == "gemini/gemini-3-flash-preview"
+    # With no alias map, canonical_key strips the "gemini/" prefix.
+    assert s.rows[0].model == "gemini-3-flash-preview"
+    assert s.rows[0].variants == (("gemini/gemini-3-flash-preview", "gemini-3-flash-preview"),)
+
+
+def test_summarise_collapses_variants_via_alias_map(db):
+    """Three historical shapes of the same model roll up into one row."""
+    for i, (model, resolved) in enumerate(
+        [
+            ("gemini-3-flash-preview", ""),                      # pre provider-prefix era
+            ("gemini/gemini-3-flash-preview", ""),               # prefixed, no resolved
+            ("gemini/gemini-3-flash-preview", "gemini-3-flash-preview"),  # prefixed + resolved
+        ]
+    ):
+        _insert(
+            db,
+            id=f"r{i}",
+            model=model,
+            resolved_model=resolved,
+            input_tokens=1000,
+            output_tokens=100,
+            cost_usd=None,
+            datetime_utc=f"2026-04-20T0{i}:00:00+00:00",
+        )
+    # Alias map as llm would expose it: every alias (and the canonical id)
+    # maps to the canonical model_id.
+    alias_map = {
+        "gemini/gemini-3-flash-preview": "gemini/gemini-3-flash-preview",
+        "gemini-3-flash-preview": "gemini/gemini-3-flash-preview",
+    }
+    s = summarise(db, alias_map=alias_map)
+    assert len(s.rows) == 1
+    row = s.rows[0]
+    assert row.model == "gemini/gemini-3-flash-preview"
+    assert row.response_count == 3
+    assert row.input_tokens == 3000
+    assert len(row.variants) == 3
+    # Pricing still resolves via _canonical inside pricing.resolve().
+    assert row.priced is True
+
+
+def test_summarise_without_alias_map_falls_back_to_heuristic(db):
+    """Rows that only differ by prefix/resolved still collapse via _canonical."""
+    _insert(
+        db,
+        id="a",
+        model="gemini-3-flash-preview",
+        resolved_model="",
+        input_tokens=1000,
+        output_tokens=0,
+        cost_usd=None,
+        datetime_utc="2026-04-20T00:00:00+00:00",
+    )
+    _insert(
+        db,
+        id="b",
+        model="gemini/gemini-3-flash-preview",
+        resolved_model="gemini-3-flash-preview",
+        input_tokens=2000,
+        output_tokens=0,
+        cost_usd=None,
+        datetime_utc="2026-04-20T01:00:00+00:00",
+    )
+    s = summarise(db)  # no alias map
+    assert len(s.rows) == 1
+    assert s.rows[0].model == "gemini-3-flash-preview"
+    assert s.rows[0].input_tokens == 3000
+
+
+def test_canonical_key_prefers_alias_over_heuristic():
+    amap = {"claude-haiku-4.5": "anthropic/claude-haiku-4-5-20251001"}
+    # Resolved wins when it's in the alias map
+    assert canonical_key("anything", "claude-haiku-4.5", amap) == (
+        "anthropic/claude-haiku-4-5-20251001"
+    )
+    # Raw name wins when resolved isn't set
+    assert canonical_key("claude-haiku-4.5", None, amap) == (
+        "anthropic/claude-haiku-4-5-20251001"
+    )
+    # Falls back to the stripping heuristic when neither hits
+    assert canonical_key("gemini/unknown-model", None, amap) == "unknown-model"
 
 
 def test_summarise_honours_custom_prices(db):

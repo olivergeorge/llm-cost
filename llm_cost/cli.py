@@ -127,6 +127,23 @@ def _format_tokens(n: int) -> str:
     return str(n)
 
 
+def format_money(amount: float) -> str:
+    """Render a USD amount at the precision that makes sense for its magnitude.
+
+    Totals and headline sums are dollars-and-cents: ``$8.05``, ``$0.15``.
+    Per-request costs are regularly sub-cent (a short prompt on a cheap
+    model can ring up $0.0017), and rounding those to ``$0.00`` would
+    misread as free. So:
+
+    - Amount rounds to ``$0.01`` or more → two decimals.
+    - Below ``$0.01`` and non-zero → four decimals (``$0.0017``).
+    - Exact zero → ``$0.00`` regardless.
+    """
+    if amount == 0 or round(abs(amount), 2) >= 0.01:
+        return f"${amount:,.2f}"
+    return f"${amount:,.4f}"
+
+
 def _render_table(summary: Summary, label: str) -> str:
     if not summary.rows:
         return f"No responses logged {label}."
@@ -140,7 +157,7 @@ def _render_table(summary: Summary, label: str) -> str:
                 str(row.response_count),
                 _format_tokens(row.input_tokens),
                 _format_tokens(row.output_tokens),
-                f"${row.best_cost_usd:,.4f}",
+                format_money(row.best_cost_usd),
                 row.source,
             )
         )
@@ -164,7 +181,7 @@ def _render_table(summary: Summary, label: str) -> str:
                 str(summary.total_responses),
                 _format_tokens(summary.total_input),
                 _format_tokens(summary.total_output),
-                f"${summary.total_cost_usd:,.4f}",
+                format_money(summary.total_cost_usd),
                 "",
             ]
         )
@@ -197,7 +214,7 @@ def _render_daily(days: tuple[DailyRow, ...], head: Headlines) -> str:
     bar_width = 20
     date_w = 10
     resps_w = max(len("resps"), *(len(str(d.responses)) for d in days))
-    cost_strs = [f"${d.cost_usd:,.4f}" for d in days]
+    cost_strs = [format_money(d.cost_usd) for d in days]
     cost_w = max(len("cost"), *(len(s) for s in cost_strs))
 
     out.append(f"Spend — last {len(days)} days")
@@ -219,10 +236,10 @@ def _render_daily(days: tuple[DailyRow, ...], head: Headlines) -> str:
 
     out.append("")
     label_w = len("This month")
-    out.append(f"{'Today'.ljust(label_w)}  ${head.today:,.4f}")
-    out.append(f"{'This week'.ljust(label_w)}  ${head.this_week:,.4f}  (last 7 days)")
-    out.append(f"{'This month'.ljust(label_w)}  ${head.this_month:,.4f}  (month-to-date)")
-    out.append(f"{'All time'.ljust(label_w)}  ${head.all_time:,.4f}")
+    out.append(f"{'Today'.ljust(label_w)}  {format_money(head.today)}")
+    out.append(f"{'This week'.ljust(label_w)}  {format_money(head.this_week)}  (week-to-date)")
+    out.append(f"{'This month'.ljust(label_w)}  {format_money(head.this_month)}  (month-to-date)")
+    out.append(f"{'All time'.ljust(label_w)}  {format_money(head.all_time)}")
 
     if head.top_models_month:
         out.append("")
@@ -233,7 +250,10 @@ def _render_daily(days: tuple[DailyRow, ...], head: Headlines) -> str:
         model_w = max(len(r.model) for r in head.top_models_month)
         for r in head.top_models_month:
             pct = r.best_cost_usd / month_total * 100
-            out.append(f"  {r.model.ljust(model_w)}  ${r.best_cost_usd:>10,.4f}  ({pct:>4.1f}%)")
+            out.append(
+                f"  {r.model.ljust(model_w)}  "
+                f"{format_money(r.best_cost_usd).rjust(10)}  ({pct:>4.1f}%)"
+            )
 
     out.append("")
     out.append(
@@ -278,7 +298,7 @@ def _render_dupes(report: DupeReport) -> str:
             r.model,
             str(r.dupe_groups),
             str(r.extra_calls),
-            f"${r.wasted_usd:,.4f}",
+            format_money(r.wasted_usd),
         )
         for r in report.rows
     ]
@@ -299,7 +319,7 @@ def _render_dupes(report: DupeReport) -> str:
                 "TOTAL",
                 str(report.total_groups),
                 str(report.total_extra_calls),
-                f"${report.total_wasted_usd:,.4f}",
+                format_money(report.total_wasted_usd),
             ]
         )
     )
@@ -345,7 +365,7 @@ def _render_top(rows: tuple[ExpensiveResponse, ...], by: str) -> str:
                 r.model,
                 _format_tokens(r.input_tokens),
                 _format_tokens(r.output_tokens),
-                f"${r.cost_usd:,.4f}",
+                format_money(r.cost_usd),
                 r.prompt_preview,
             )
         )

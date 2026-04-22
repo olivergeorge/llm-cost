@@ -6,6 +6,11 @@ llm core's ``Token usage:`` line. The hook fires from
 ``after_log_to_db`` so the order is predictable and the cost reflects
 the final token counts llm persisted.
 
+The amount is rendered via :func:`llm_cost.cli.format_money`, which
+drops to four decimals for sub-cent amounts — otherwise a short prompt
+on a cheap model would display as ``$0.00`` and look free when it
+isn't.
+
 Enable state follows the same ContextVar-plus-env pattern as
 llm-replay so concurrent async library use doesn't leak enablement.
 """
@@ -18,6 +23,7 @@ from contextvars import ContextVar
 import click
 
 from . import pricing
+from .cli import format_money
 from .summary import canonical_key
 
 _ENABLED: ContextVar[bool | None] = ContextVar("llm_cost_inline_enabled", default=None)
@@ -74,7 +80,7 @@ def format_cost_line(
     else:
         cost = 0.0
         source = "unpriced"
-    return f"Cost: ${cost:,.4f} ({source})"
+    return f"Cost: {format_money(cost)} ({source})"
 
 
 def emit_cost_for_response(response) -> None:

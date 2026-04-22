@@ -384,7 +384,7 @@ class Headlines:
     """Headline spend numbers for the default ``llm cost`` landing."""
 
     today: float
-    this_week: float  # trailing 7 days inclusive of today
+    this_week: float  # calendar week-to-date (Monday start, inclusive of today)
     this_month: float  # calendar month-to-date
     all_time: float
     top_models_month: tuple[ModelUsage, ...]
@@ -468,7 +468,10 @@ def headlines(
     _, today_end = local_day_bounds(today)
 
     today_start, _ = local_day_bounds(today)
-    week_start, _ = local_day_bounds(today - timedelta(days=6))
+    # Monday-start ISO week so the week and month rows agree on calendar
+    # semantics: "This week" now parallels "This month" as calendar-to-date,
+    # not a trailing 7-day window.
+    week_start, _ = local_day_bounds(today - timedelta(days=today.weekday()))
     month_start, _ = local_day_bounds(today.replace(day=1))
 
     def _cost(since):

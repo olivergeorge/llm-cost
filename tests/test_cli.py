@@ -296,7 +296,7 @@ def test_cost_dupes_with_index(cli, tmp_path: Path):
     assert "Dupe spend" in result.output
     assert "claude-opus-4-6" in result.output
     # 1 extra call @ $5/1M * 1M = $5 wasted
-    assert "$5.0000" in result.output
+    assert "$5.00" in result.output
 
 
 def test_cost_default_daily_json(cli, seeded_db: Path):
@@ -309,3 +309,39 @@ def test_cost_default_daily_json(cli, seeded_db: Path):
     assert set(payload["headlines"]) == {
         "today", "this_week", "this_month", "all_time", "top_models_month"
     }
+
+
+class TestFormatMoney:
+    """Dollars-and-cents for aggregates, sub-cent precision for tiny per-request costs."""
+
+    def test_cents_above_a_penny(self):
+        from llm_cost.cli import format_money
+
+        assert format_money(8.0463) == "$8.05"
+        assert format_money(0.15) == "$0.15"
+        assert format_money(1_234.5) == "$1,234.50"
+
+    def test_sub_cent_keeps_four_decimals(self):
+        from llm_cost.cli import format_money
+
+        # A short prompt on a cheap model legitimately costs this much;
+        # 2dp would collapse it to "$0.00" which reads as free.
+        assert format_money(0.0017) == "$0.0017"
+        assert format_money(0.003) == "$0.0030"
+
+    def test_exact_zero_uses_cents(self):
+        from llm_cost.cli import format_money
+
+        # Unpriced model → $0 exactly → display as $0.00 (not $0.0000),
+        # since zero has no precision to lose and the aggregate format
+        # is the least surprising.
+        assert format_money(0) == "$0.00"
+
+    def test_boundary_just_below_a_penny(self):
+        from llm_cost.cli import format_money
+
+        # $0.0099 rounds to $0.01 at 2dp → belongs in the cents bucket.
+        assert format_money(0.0099) == "$0.01"
+        # $0.0049 rounds to $0.00 at 2dp → keep four decimals so it's
+        # not indistinguishable from exact zero.
+        assert format_money(0.0049) == "$0.0049"

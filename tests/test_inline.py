@@ -46,7 +46,7 @@ def test_format_cost_line_priced():
         alias_map=alias_map,
     )
     # 1M * $5 + 0.1M * $25 = $7.50
-    assert line == "Cost: $7.5000 (priced)"
+    assert line == "Cost: $7.50 (priced)"
 
 
 def test_format_cost_line_unpriced():
@@ -57,7 +57,7 @@ def test_format_cost_line_unpriced():
         output_tokens=200,
         alias_map={},
     )
-    assert line == "Cost: $0.0000 (unpriced)"
+    assert line == "Cost: $0.00 (unpriced)"
 
 
 def test_after_log_to_db_skips_when_disabled(monkeypatch, capsys):
@@ -76,7 +76,7 @@ def test_after_log_to_db_emits_when_enabled(monkeypatch, capsys):
     after_log_to_db(response, db=None)
     captured = capsys.readouterr()
     # Anthropic prefix strips to claude-opus-4-6 via the heuristic path.
-    assert "Cost: $5.0000 (priced)" in captured.err
+    assert "Cost: $5.00 (priced)" in captured.err
 
 
 def test_cost_flag_injected_into_prompt_command():

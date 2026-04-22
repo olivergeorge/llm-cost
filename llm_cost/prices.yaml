@@ -1,0 +1,45 @@
+# USD per 1,000,000 tokens. Override with --prices PATH or LLM_COST_PRICES=PATH.
+# Keys are canonical model names (no provider prefix). The resolver strips
+# "gemini/", "anthropic/", trailing "-latest", "-customtools", date suffixes
+# like "-20251001" etc. before lookup.
+#
+# Snapshot tracks tasict/acidifier/tool/models.json.
+
+# --- Anthropic ---
+claude-opus-4-6:
+  input: 5.0
+  output: 25.0
+claude-sonnet-4-6:
+  input: 3.0
+  output: 15.0
+claude-haiku-4-5:
+  input: 0.8
+  output: 4.0
+
+# --- OpenAI ---
+gpt-5.4:
+  input: 2.5
+  output: 15.0
+gpt-5.4-mini:
+  input: 0.75
+  output: 4.5
+gpt-5.4-nano:
+  input: 0.2
+  output: 1.25
+
+# --- Google Gemini ---
+gemini-3.1-pro-preview:
+  input: 2.0
+  output: 12.0
+gemini-3-pro-preview:
+  input: 2.0
+  output: 12.0
+gemini-3-flash-preview:
+  input: 0.5
+  output: 3.0
+gemini-3.1-flash-lite-preview:
+  input: 0.25
+  output: 1.5
+gemini-2.5-flash-lite:
+  input: 0.1
+  output: 0.4

@@ -23,6 +23,26 @@ llm cost dupes --days 30
 llm cost models                 # list models in the active price table
 ```
 
+## Inline per-response cost (`--cost`)
+
+Analog of llm's `-u` usage flag: prints the cost of a single call to
+stderr after it finishes.
+
+```sh
+llm 'hello' --cost
+# Hi, how are?
+# Cost: $0.0000 (priced)
+
+llm 'write a 200 word essay about sqlite' --cost -u
+# ...essay...
+# Token usage: 11 input, 253 output, {...}
+# Cost: $0.0004 (priced)
+```
+
+Enable globally with `LLM_COST=1`, override per-call with `--no-cost`.
+When the model isn't in the price table the line reads
+`Cost: $0.0000 (unpriced)` so you can see something's off.
+
 ## The default landing
 
 Bare `llm cost` gives you a 14-day sparkline plus headline totals:

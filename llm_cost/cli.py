@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import functools
 import json
 import os
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Callable
 
 import click
 import llm
@@ -123,7 +122,7 @@ def _render_table(summary: Summary, label: str) -> str:
     widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
 
     def line(cells):
-        return "  ".join(c.ljust(w) for c, w in zip(cells, widths))
+        return "  ".join(c.ljust(w) for c, w in zip(cells, widths, strict=False))
 
     out = [
         f"Spend {label}",

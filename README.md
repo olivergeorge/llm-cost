@@ -1,10 +1,9 @@
 # llm-cost
 
-Token and spend reports over the [llm](https://llm.datasette.io) logs database.
+Token and spend reports over the [`llm`](https://llm.datasette.io) CLI's
+logs database.
 
 ```sh
-llm install llm-cost
-
 llm cost                        # daily sparkline + today/week/month/all-time
 llm cost today                  # per-model table for today (local time)
 llm cost --since 2026-04-01     # month-to-date
@@ -22,6 +21,55 @@ llm cost dupes --days 30
 
 llm cost models                 # list models in the active price table
 ```
+
+## Requirements
+
+The reporting commands (`llm cost …`) work against a vanilla `llm`
+install — they read straight from the logs SQLite, no hookspecs
+required. The optional [inline `--cost` flag](#inline-per-response-cost---cost)
+depends on **one hookspec that is not yet in upstream `llm`**, on a
+branch of [olivergeorge/llm](https://github.com/olivergeorge/llm)
+pending upstream merge.
+
+| Hook | Purpose in this plugin | Branch |
+| ---- | ---------------------- | ------ |
+| [`after_log_to_db`](https://github.com/olivergeorge/llm/blob/llm-after-log-to-db/docs/plugins/plugin-hooks.md#after_log_to_dbresponse-db) | Fires after the response is persisted, so the plugin can compute cost from the in-memory token counts and print the inline cost line at the same point `llm -u` prints `Token usage:`. | [`llm-after-log-to-db`](https://github.com/olivergeorge/llm/tree/llm-after-log-to-db) |
+| The above + the prompt-gates and replay-stores hookspecs | Single-branch superset, shared with `llm-confirm-tokens` and `llm-replay`. | [`combined-prs`](https://github.com/olivergeorge/llm/tree/combined-prs) |
+
+Without `after_log_to_db` there is no clean place in `llm`'s surface
+to attach a per-response side effect — the alternative is
+monkey-patching `_BaseResponse.log_to_db`, which is fragile across
+versions and hostile to other plugins doing the same. The reporting
+commands don't touch this hook; skip the fork if you don't want the
+inline flag.
+
+## Install
+
+For the reporting commands only (works against stock `llm`):
+
+```bash
+llm install llm-cost
+```
+
+For the inline `--cost` flag, also install the fork that carries
+`after_log_to_db`. `combined-prs` is the single-branch superset:
+
+```bash
+# Clone and install the fork on the combined branch
+git clone -b combined-prs https://github.com/olivergeorge/llm.git
+llm install -e ./llm
+
+# Install the plugin
+llm install llm-cost
+```
+
+If you only need the inline flag (no other forked plugins),
+[`llm-after-log-to-db`](https://github.com/olivergeorge/llm/tree/llm-after-log-to-db)
+on its own is sufficient.
+
+If you already have a local checkout of `../llm`, `pyproject.toml`
+points at it as an editable dependency — check out `combined-prs`
+(or `llm-after-log-to-db`) there and run `uv sync` / `pip install -e .`.
 
 ## Inline per-response cost (`--cost`)
 

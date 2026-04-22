@@ -223,9 +223,8 @@ def _render_daily(days: tuple[DailyRow, ...], head: Headlines) -> str:
     if head.top_models_month:
         out.append("")
         out.append("Top models this month:")
-        total = sum(r.best_cost_usd for r in head.top_models_month) or 1.0
-        # Scale percentages against the month total, not the top-N subtotal,
-        # so the reader sees the true share of spend.
+        # Scale against the month total, not the top-N subtotal, so the
+        # percentage shown is the true share of spend.
         month_total = head.this_month or 1.0
         model_w = max(len(r.model) for r in head.top_models_month)
         for r in head.top_models_month:

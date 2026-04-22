@@ -56,3 +56,39 @@ cd llm-cost
 uv sync
 uv run pytest
 ```
+
+## Backlog
+
+Unprioritised laundry list, roughly sorted by bang-for-buck at the top:
+
+- Collapse duplicate rows where the same model appears once with
+  `resolved_model` set and once without (currently shown as separate rows —
+  informative, but noisy).
+- `llm cost --by day` / `--by week` / `--by month` for trend reports.
+- `--top N` and `--sort cost|tokens|responses` for the table renderer.
+- CSV export (`--csv` or `--format csv`) for dropping into a spreadsheet.
+- Cached-input pricing for Gemini (the `cached_input_cost_per_1m` field in
+  `models.json` — currently we use the full input price).
+- Group by conversation (`llm cost --by conversation`) so you can see which
+  piece of work cost the most.
+- Group by schema tag (the `schema_id` column) to report cost per workflow.
+- Break out reasoning / thinking tokens using the `token_details` JSON
+  (Gemini's `thoughtsTokenCount`, Anthropic's thinking tokens, OpenAI's
+  reasoning tokens) — useful when thinking-heavy runs dominate spend.
+- Break out input modalities from `token_details.promptTokensDetails`
+  (TEXT vs IMAGE vs AUDIO) so image-heavy prompts are visible.
+- Budget alerts: `llm cost --budget 5` exits non-zero when today's spend
+  exceeds the threshold, so it can gate CI or a shell prompt.
+- Sparkline of daily spend next to the totals line, or a small ASCII chart
+  via `--chart`.
+- `llm cost watch` that streams new responses as they're logged and keeps a
+  running total for the current session.
+- Publish the snapshot of `prices.yaml` somewhere shared (a GitHub gist
+  or a tiny companion repo) so it can drift forward between plugin
+  releases without a code change.
+- `llm cost diff --since A --until B` to compare two windows side-by-side
+  (this month vs last month, etc.).
+- Currency conversion for non-USD reporting (hit an FX rate once per run).
+- Export to the `responses` table itself: backfill missing `cost_usd`
+  values using the price table, so downstream tools see consistent data.
+

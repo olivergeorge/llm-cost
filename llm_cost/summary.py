@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import Iterable
 
 import sqlite_utils
@@ -59,7 +59,7 @@ class Summary:
         return any(not r.priced and r.logged_cost_usd == 0 for r in self.rows)
 
 
-def local_day_bounds(day: date, tz: timezone | None = None) -> tuple[datetime, datetime]:
+def local_day_bounds(day: date, tz: tzinfo | None = None) -> tuple[datetime, datetime]:
     """Return the UTC half-open interval [start, end) that covers ``day``
     in the given timezone (local by default).
 

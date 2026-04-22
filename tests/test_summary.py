@@ -381,6 +381,118 @@ def test_top_responses_prompt_preview_is_single_line(db):
     assert rows[0].prompt_preview == "line one line two tabbed line four"
 
 
+def _insert_replay_index(db, response_id: str, request_key: str):
+    if not db["replay_index"].exists():
+        db["replay_index"].create(
+            {"response_id": str, "request_key": str, "chain_hash": str},
+            pk="response_id",
+        )
+    db["replay_index"].insert({
+        "response_id": response_id,
+        "request_key": request_key,
+        "chain_hash": f"ch-{response_id}",
+    })
+
+
+def test_dupe_report_missing_replay_index(db):
+    from llm_cost.summary import dupe_report
+
+    _insert(
+        db,
+        id="r1",
+        model="anthropic/claude-opus-4-6",
+        resolved_model="claude-opus-4-6",
+        input_tokens=1000,
+        output_tokens=100,
+        cost_usd=None,
+        datetime_utc="2026-04-20T10:00:00+00:00",
+    )
+    report = dupe_report(db)
+    assert report.replay_index_present is False
+    assert report.rows == ()
+    assert report.total_responses == 1
+    assert report.indexed_responses == 0
+
+
+def test_dupe_report_identifies_waste(db):
+    from llm_cost.summary import dupe_report
+
+    # Three real calls with the same request_key — two are dupes.
+    for i, ts in enumerate(
+        ["2026-04-20T10:00:00+00:00", "2026-04-20T11:00:00+00:00", "2026-04-20T12:00:00+00:00"]
+    ):
+        _insert(
+            db,
+            id=f"dup{i}",
+            model="anthropic/claude-opus-4-6",
+            resolved_model="claude-opus-4-6",
+            input_tokens=1_000_000,
+            output_tokens=0,
+            cost_usd=None,
+            datetime_utc=ts,
+        )
+        _insert_replay_index(db, f"dup{i}", "same-request-key")
+
+    # One unique request — shouldn't appear.
+    _insert(
+        db,
+        id="unique",
+        model="anthropic/claude-opus-4-6",
+        resolved_model="claude-opus-4-6",
+        input_tokens=500_000,
+        output_tokens=0,
+        cost_usd=None,
+        datetime_utc="2026-04-20T13:00:00+00:00",
+    )
+    _insert_replay_index(db, "unique", "other-request-key")
+
+    report = dupe_report(db)
+    assert report.replay_index_present is True
+    assert report.total_groups == 1
+    assert report.total_extra_calls == 2  # 3 calls, 1 kept, 2 replayable
+    # Each call is 1M * $5 = $5, so 2 wasted calls = $10
+    assert report.total_wasted_usd == pytest.approx(10.0)
+    assert len(report.rows) == 1
+    row = report.rows[0]
+    assert row.model == "claude-opus-4-6"
+    assert row.dupe_groups == 1
+    assert row.extra_calls == 2
+
+
+def test_dupe_report_ignores_replays(db):
+    """Responses marked as replays (replay_of IS NOT NULL) don't count."""
+    from llm_cost.summary import dupe_report
+
+    _insert(
+        db,
+        id="original",
+        model="anthropic/claude-opus-4-6",
+        resolved_model="claude-opus-4-6",
+        input_tokens=1000,
+        output_tokens=0,
+        cost_usd=None,
+        datetime_utc="2026-04-20T10:00:00+00:00",
+    )
+    # Replayed — no API call happened, shouldn't be counted as a dupe.
+    _insert(
+        db,
+        id="replay",
+        model="anthropic/claude-opus-4-6",
+        resolved_model="claude-opus-4-6",
+        input_tokens=1000,
+        output_tokens=0,
+        cost_usd=None,
+        datetime_utc="2026-04-20T11:00:00+00:00",
+        replay_of="original",
+    )
+    _insert_replay_index(db, "original", "shared-key")
+    _insert_replay_index(db, "replay", "shared-key")
+
+    report = dupe_report(db)
+    assert report.total_groups == 0
+    assert report.total_wasted_usd == 0.0
+
+
 def test_canonical_key_prefers_alias_over_heuristic():
     amap = {"claude-haiku-4.5": "anthropic/claude-haiku-4-5-20251001"}
     # Resolved wins when it's in the alias map

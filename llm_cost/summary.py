@@ -494,6 +494,190 @@ def headlines(
     )
 
 
+@dataclass(frozen=True)
+class DupeRow:
+    model: str  # canonical
+    dupe_groups: int  # distinct request_keys where ≥2 real API calls fired
+    extra_calls: int  # total_real_calls in dupe_groups − dupe_groups
+    wasted_usd: float  # sum over groups of (group_total_cost − first_call_cost)
+
+
+@dataclass(frozen=True)
+class DupeReport:
+    rows: tuple[DupeRow, ...]
+    total_groups: int
+    total_extra_calls: int
+    total_wasted_usd: float
+    indexed_responses: int  # responses from the window that have a replay_index row
+    total_responses: int  # total responses in the window
+    replay_index_present: bool
+
+
+def dupe_report(
+    db: sqlite_utils.Database,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    model_glob: str | None = None,
+    prices: dict[str, Price] | None = None,
+    alias_map: dict[str, str] | None = None,
+) -> DupeReport:
+    """Identify duplicate requests that could have been replayed.
+
+    Joins ``responses`` against ``replay_index`` (written by llm-replay)
+    on ``request_key``. A dupe group is a set of ≥2 real API calls
+    (``replay_of IS NULL``) sharing the same request_key. Savings per
+    group assume you kept the first call and replayed the rest:
+    ``sum(cost) − first_call_cost``.
+
+    If ``replay_index`` doesn't exist (llm-replay not installed), the
+    report returns empty with ``replay_index_present=False`` so the
+    caller can advise the user.
+    """
+    table = prices if prices is not None else default_prices()
+
+    total_count = _count_responses(db, since, until, model_glob)
+
+    if not db["replay_index"].exists():
+        return DupeReport(
+            rows=(),
+            total_groups=0,
+            total_extra_calls=0,
+            total_wasted_usd=0.0,
+            indexed_responses=0,
+            total_responses=total_count,
+            replay_index_present=False,
+        )
+
+    clauses = ["r.replay_of IS NULL"]
+    params: list[object] = []
+    if since is not None:
+        clauses.append("r.datetime_utc >= ?")
+        params.append(_iso(since))
+    if until is not None:
+        clauses.append("r.datetime_utc < ?")
+        params.append(_iso(until))
+    if model_glob:
+        clauses.append("r.model LIKE ?")
+        params.append(model_glob)
+
+    where = " AND ".join(clauses)
+
+    indexed_count_sql = f"""
+        SELECT COUNT(*) FROM responses r
+        JOIN replay_index i ON i.response_id = r.id
+        WHERE {where}
+    """
+    indexed_count = next(iter(db.execute(indexed_count_sql, params)))[0]
+
+    # Pull every real-API-call row that shares a request_key with ≥1 other
+    # real-API-call row in the same window. HAVING inside the subquery is
+    # what limits us to actual dupes instead of every indexed row.
+    sql = f"""
+        SELECT
+            i.request_key,
+            r.id,
+            r.model,
+            COALESCE(r.resolved_model, '') AS resolved_model,
+            r.datetime_utc,
+            COALESCE(r.input_tokens, 0) AS input_tokens,
+            COALESCE(r.output_tokens, 0) AS output_tokens,
+            COALESCE(r.cost_usd, 0) AS logged_cost
+        FROM replay_index i
+        JOIN responses r ON r.id = i.response_id
+        WHERE {where}
+          AND i.request_key IN (
+              SELECT i2.request_key
+              FROM replay_index i2
+              JOIN responses r2 ON r2.id = i2.response_id
+              WHERE {where.replace('r.', 'r2.')}
+              GROUP BY i2.request_key
+              HAVING COUNT(*) > 1
+          )
+        ORDER BY i.request_key, r.datetime_utc
+    """
+    # The subquery reuses the same filters; duplicate the params list.
+    groups_by_key: dict[str, list[tuple]] = {}
+    for row in db.execute(sql, params + params):
+        key = row[0]
+        groups_by_key.setdefault(key, []).append(row)
+
+    per_model: dict[str, dict] = {}
+    total_wasted = 0.0
+    total_extra = 0
+    for group in groups_by_key.values():
+        # Pick the first call (already date-sorted) — that's the "kept" one.
+        first = group[0]
+        rest = group[1:]
+        group_model = canonical_key(first[2], first[3] or None, alias_map)
+        price = resolve(group_model, None, table)
+
+        def _cost(row) -> float:
+            _, _, model, resolved, _, inp, outp, logged = row
+            logged_f = float(logged)
+            if logged_f > 0:
+                return logged_f
+            return price.cost(int(inp), int(outp)) if price else 0.0
+
+        wasted = sum(_cost(r) for r in rest)
+        bucket = per_model.setdefault(
+            group_model,
+            {"groups": 0, "extra_calls": 0, "wasted": 0.0},
+        )
+        bucket["groups"] += 1
+        bucket["extra_calls"] += len(rest)
+        bucket["wasted"] += wasted
+        total_wasted += wasted
+        total_extra += len(rest)
+
+    rows = tuple(
+        sorted(
+            (
+                DupeRow(
+                    model=m,
+                    dupe_groups=b["groups"],
+                    extra_calls=b["extra_calls"],
+                    wasted_usd=b["wasted"],
+                )
+                for m, b in per_model.items()
+            ),
+            key=lambda r: r.wasted_usd,
+            reverse=True,
+        )
+    )
+
+    return DupeReport(
+        rows=rows,
+        total_groups=len(groups_by_key),
+        total_extra_calls=total_extra,
+        total_wasted_usd=total_wasted,
+        indexed_responses=int(indexed_count),
+        total_responses=total_count,
+        replay_index_present=True,
+    )
+
+
+def _count_responses(
+    db: sqlite_utils.Database,
+    since: datetime | None,
+    until: datetime | None,
+    model_glob: str | None,
+) -> int:
+    clauses: list[str] = []
+    params: list[object] = []
+    if since is not None:
+        clauses.append("datetime_utc >= ?")
+        params.append(_iso(since))
+    if until is not None:
+        clauses.append("datetime_utc < ?")
+        params.append(_iso(until))
+    if model_glob:
+        clauses.append("model LIKE ?")
+        params.append(model_glob)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = f"SELECT COUNT(*) FROM responses {where}"
+    return int(next(iter(db.execute(sql, params)))[0])
+
+
 def models_without_prices(summary: Summary) -> Iterable[str]:
     """Yield canonical names for groups with no price hit *and* no logged cost."""
     seen: set[str] = set()

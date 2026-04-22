@@ -15,10 +15,12 @@ import sqlite_utils
 from .pricing import default_prices, load_prices
 from .summary import (
     DailyRow,
+    DupeReport,
     ExpensiveResponse,
     Headlines,
     Summary,
     daily_summary,
+    dupe_report,
     headlines,
     local_day_bounds,
     models_without_prices,
@@ -251,6 +253,85 @@ def _local_clock(dt_iso: str) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
+def _render_dupes(report: DupeReport) -> str:
+    if not report.replay_index_present:
+        return (
+            "No replay index found. Install llm-replay to track duplicate\n"
+            "requests: `llm install llm-replay` then run some prompts.\n"
+            "Future runs of `llm cost dupes` will then see the index."
+        )
+
+    header = (
+        f"Dupe spend — {report.indexed_responses} / {report.total_responses} "
+        f"responses in window are indexed"
+    )
+    if not report.rows:
+        return (
+            header
+            + "\n\nNo duplicate requests detected in this window. Nice.\n"
+            "(Either every request was unique, or replays kicked in already.)"
+        )
+
+    headers = ("model", "dupe-groups", "extra-calls", "wasted $")
+    table_rows = [
+        (
+            r.model,
+            str(r.dupe_groups),
+            str(r.extra_calls),
+            f"${r.wasted_usd:,.4f}",
+        )
+        for r in report.rows
+    ]
+    widths = [
+        max(len(headers[i]), *(len(row[i]) for row in table_rows))
+        for i in range(len(headers))
+    ]
+
+    def line(cells):
+        return "  ".join(c.ljust(w) for c, w in zip(cells, widths, strict=True))
+
+    out = [header, "", line(headers), line(["-" * w for w in widths])]
+    out.extend(line(r) for r in table_rows)
+    out.append(line(["-" * w for w in widths]))
+    out.append(
+        line(
+            [
+                "TOTAL",
+                str(report.total_groups),
+                str(report.total_extra_calls),
+                f"${report.total_wasted_usd:,.4f}",
+            ]
+        )
+    )
+    out.append("")
+    out.append(
+        "Tip: pass --replay to `llm prompt` (or set LLM_REPLAY=1) to replay\n"
+        "identical requests for free. See llm-replay."
+    )
+    return "\n".join(out)
+
+
+def _render_dupes_json(report: DupeReport) -> str:
+    payload = {
+        "replay_index_present": report.replay_index_present,
+        "indexed_responses": report.indexed_responses,
+        "total_responses": report.total_responses,
+        "total_groups": report.total_groups,
+        "total_extra_calls": report.total_extra_calls,
+        "total_wasted_usd": report.total_wasted_usd,
+        "rows": [
+            {
+                "model": r.model,
+                "dupe_groups": r.dupe_groups,
+                "extra_calls": r.extra_calls,
+                "wasted_usd": r.wasted_usd,
+            }
+            for r in report.rows
+        ],
+    }
+    return json.dumps(payload, indent=2)
+
+
 def _render_top(rows: tuple[ExpensiveResponse, ...], by: str) -> str:
     if not rows:
         return "No responses in that window."
@@ -447,6 +528,51 @@ def register_commands(cli: click.Group) -> None:
     ) -> None:
         """Per-model spend across all logged responses (escape hatch)."""
         _report(None, None, "all time", model_glob, prices_path, as_json, db_path)
+
+    @cost_group.command(name="dupes")
+    @click.option("--since", type=str, help="Start date YYYY-MM-DD.")
+    @click.option("--until", type=str, help="End date YYYY-MM-DD.")
+    @click.option("--days", type=int, help="Last N days (including today).")
+    @_shared_options
+    def cost_dupes(
+        since: str | None,
+        until: str | None,
+        days: int | None,
+        model_glob: str | None,
+        prices_path: Path | None,
+        as_json: bool,
+        db_path: Path | None,
+    ) -> None:
+        """Report duplicate requests that could have been replayed.
+
+        Joins against llm-replay's ``replay_index`` to identify sets of
+        identical API calls. Savings assume you'd have kept the first
+        call and replayed the rest.
+        """
+        if days is not None:
+            today = _today_local()
+            start, _ = local_day_bounds(today - timedelta(days=days - 1))
+            _, end = local_day_bounds(today)
+        else:
+            start = local_day_bounds(_parse_date(since))[0] if since else None
+            end = local_day_bounds(_parse_date(until))[1] if until else None
+
+        prices = _load_price_table(prices_path)
+        amap = _alias_map()
+        db = sqlite_utils.Database(str(db_path or _logs_db_path()))
+        report = dupe_report(
+            db,
+            since=start,
+            until=end,
+            model_glob=model_glob,
+            prices=prices,
+            alias_map=amap,
+        )
+
+        if as_json:
+            click.echo(_render_dupes_json(report))
+        else:
+            click.echo(_render_dupes(report))
 
     @cost_group.command(name="top")
     @click.option("--limit", "-n", type=int, default=10, help="How many rows (default 10).")

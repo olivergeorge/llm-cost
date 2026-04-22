@@ -17,7 +17,7 @@ from llm_cost.summary import (
 
 @pytest.fixture
 def db(tmp_path):
-    """A fresh logs.db with just the columns llm-cost reads."""
+    """A fresh logs.db with the columns llm-cost reads."""
     path = tmp_path / "logs.db"
     d = sqlite_utils.Database(path)
     d["responses"].create(
@@ -25,10 +25,13 @@ def db(tmp_path):
             "id": str,
             "model": str,
             "resolved_model": str,
+            "prompt": str,
             "input_tokens": int,
             "output_tokens": int,
             "cost_usd": float,
             "datetime_utc": str,
+            "chain_hash": str,
+            "replay_of": str,
         },
         pk="id",
     )
@@ -299,6 +302,83 @@ def test_headlines_totals(db):
     # Top-3 is ordered by best cost (only one model here).
     assert len(head.top_models_month) == 1
     assert head.top_models_month[0].model == "claude-opus-4-6"
+
+
+def test_top_responses_by_cost(db):
+    from llm_cost.summary import top_responses
+
+    # Small cheap model, big expensive model.
+    _insert(
+        db,
+        id="cheap",
+        model="gemini/gemini-2.5-flash-lite",
+        resolved_model="",
+        input_tokens=1000,
+        output_tokens=100,
+        cost_usd=None,
+        datetime_utc="2026-04-20T10:00:00+00:00",
+    )
+    _insert(
+        db,
+        id="expensive",
+        model="anthropic/claude-opus-4-6",
+        resolved_model="claude-opus-4-6",
+        input_tokens=1_000_000,
+        output_tokens=50_000,
+        cost_usd=None,
+        datetime_utc="2026-04-20T11:00:00+00:00",
+    )
+    rows = top_responses(db, limit=5)
+    assert len(rows) == 2
+    assert rows[0].id == "expensive"
+    assert rows[0].source == "priced"
+    assert rows[0].cost_usd > rows[1].cost_usd
+
+
+def test_top_responses_by_input_tokens(db):
+    from llm_cost.summary import top_responses
+
+    _insert(
+        db,
+        id="a",
+        model="gemini/gemini-2.5-flash-lite",
+        resolved_model="",
+        input_tokens=500_000,
+        output_tokens=100,
+        cost_usd=None,
+        datetime_utc="2026-04-20T10:00:00+00:00",
+    )
+    _insert(
+        db,
+        id="b",
+        model="gemini/gemini-2.5-flash-lite",
+        resolved_model="",
+        input_tokens=200_000,
+        output_tokens=100,
+        cost_usd=None,
+        datetime_utc="2026-04-20T11:00:00+00:00",
+    )
+    rows = top_responses(db, limit=2, by="input")
+    assert [r.id for r in rows] == ["a", "b"]
+
+
+def test_top_responses_prompt_preview_is_single_line(db):
+    from llm_cost.summary import top_responses
+
+    db["responses"].insert(
+        {
+            "id": "multi",
+            "model": "anthropic/claude-opus-4-6",
+            "resolved_model": "claude-opus-4-6",
+            "prompt": "line one\n\nline two\n  tabbed\nline four",
+            "input_tokens": 1000,
+            "output_tokens": 100,
+            "cost_usd": None,
+            "datetime_utc": "2026-04-20T10:00:00+00:00",
+        }
+    )
+    rows = top_responses(db, limit=1, preview_chars=80)
+    assert rows[0].prompt_preview == "line one line two tabbed line four"
 
 
 def test_canonical_key_prefers_alias_over_heuristic():

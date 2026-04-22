@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import click
@@ -15,6 +15,7 @@ import sqlite_utils
 from .pricing import default_prices, load_prices
 from .summary import (
     DailyRow,
+    ExpensiveResponse,
     Headlines,
     Summary,
     daily_summary,
@@ -22,6 +23,7 @@ from .summary import (
     local_day_bounds,
     models_without_prices,
     summarise,
+    top_responses,
 )
 
 
@@ -238,6 +240,81 @@ def _render_daily(days: tuple[DailyRow, ...], head: Headlines) -> str:
     return "\n".join(out)
 
 
+def _local_clock(dt_iso: str) -> str:
+    """Parse an ISO UTC string and render as local ``YYYY-MM-DD HH:MM``."""
+    try:
+        dt = datetime.fromisoformat(dt_iso)
+    except ValueError:
+        return dt_iso[:16]
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _render_top(rows: tuple[ExpensiveResponse, ...], by: str) -> str:
+    if not rows:
+        return "No responses in that window."
+
+    headers = ("datetime (local)", "model", "in", "out", "cost", "prompt")
+    table_rows = []
+    for r in rows:
+        table_rows.append(
+            (
+                _local_clock(r.datetime_utc),
+                r.model,
+                _format_tokens(r.input_tokens),
+                _format_tokens(r.output_tokens),
+                f"${r.cost_usd:,.4f}",
+                r.prompt_preview,
+            )
+        )
+
+    # The prompt column stays on the right and isn't padded — it's the tail
+    # of the line so ragged endings are fine.
+    static_cols = 5
+    widths = [
+        max(len(headers[i]), *(len(row[i]) for row in table_rows))
+        for i in range(static_cols)
+    ]
+
+    def line(cells):
+        head_cells = [c.ljust(w) for c, w in zip(cells[:static_cols], widths, strict=True)]
+        return "  ".join(head_cells + [cells[static_cols]])
+
+    out = [
+        f"Top {len(rows)} expensive requests (by {by})",
+        "",
+        line(headers),
+        line(["-" * w for w in widths] + ["-" * 40]),
+    ]
+    out.extend(line(r) for r in table_rows)
+    out.append("")
+    out.append(
+        "Tip: install llm-confirm-tokens to catch big prompts before they send."
+    )
+    return "\n".join(out)
+
+
+def _render_top_json(rows: tuple[ExpensiveResponse, ...], by: str) -> str:
+    payload = {
+        "sort_by": by,
+        "rows": [
+            {
+                "id": r.id,
+                "datetime_utc": r.datetime_utc,
+                "model": r.model,
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+                "cost_usd": r.cost_usd,
+                "source": r.source,
+                "prompt_preview": r.prompt_preview,
+            }
+            for r in rows
+        ],
+    }
+    return json.dumps(payload, indent=2)
+
+
 def _render_daily_json(days: tuple[DailyRow, ...], head: Headlines) -> str:
     payload = {
         "days": [
@@ -370,6 +447,62 @@ def register_commands(cli: click.Group) -> None:
     ) -> None:
         """Per-model spend across all logged responses (escape hatch)."""
         _report(None, None, "all time", model_glob, prices_path, as_json, db_path)
+
+    @cost_group.command(name="top")
+    @click.option("--limit", "-n", type=int, default=10, help="How many rows (default 10).")
+    @click.option(
+        "--by",
+        type=click.Choice(["cost", "input", "output", "total"]),
+        default="cost",
+        help="Sort key: cost, input tokens, output tokens, or total tokens.",
+    )
+    @click.option("--since", type=str, help="Start date YYYY-MM-DD.")
+    @click.option("--until", type=str, help="End date YYYY-MM-DD.")
+    @click.option("--days", type=int, help="Last N days (including today).")
+    @_shared_options
+    def cost_top(
+        limit: int,
+        by: str,
+        since: str | None,
+        until: str | None,
+        days: int | None,
+        model_glob: str | None,
+        prices_path: Path | None,
+        as_json: bool,
+        db_path: Path | None,
+    ) -> None:
+        """Show the most expensive individual responses.
+
+        Useful for catching accidents — prompts where a whole file or
+        directory got piped in without realising. Pair with
+        `llm-confirm-tokens` to head them off before they send.
+        """
+        if days is not None:
+            today = _today_local()
+            start, _ = local_day_bounds(today - timedelta(days=days - 1))
+            _, end = local_day_bounds(today)
+        else:
+            start = local_day_bounds(_parse_date(since))[0] if since else None
+            end = local_day_bounds(_parse_date(until))[1] if until else None
+
+        prices = _load_price_table(prices_path)
+        amap = _alias_map()
+        db = sqlite_utils.Database(str(db_path or _logs_db_path()))
+        rows = top_responses(
+            db,
+            limit=limit,
+            by=by,
+            since=start,
+            until=end,
+            model_glob=model_glob,
+            prices=prices,
+            alias_map=amap,
+        )
+
+        if as_json:
+            click.echo(_render_top_json(rows, by))
+        else:
+            click.echo(_render_top(rows, by))
 
     @cost_group.command(name="today")
     @_shared_options

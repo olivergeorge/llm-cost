@@ -21,10 +21,13 @@ def seeded_db(tmp_path: Path) -> Path:
             "id": str,
             "model": str,
             "resolved_model": str,
+            "prompt": str,
             "input_tokens": int,
             "output_tokens": int,
             "cost_usd": float,
             "datetime_utc": str,
+            "chain_hash": str,
+            "replay_of": str,
         },
         pk="id",
     )
@@ -189,10 +192,13 @@ def test_cost_empty_db(cli, tmp_path: Path):
             "id": str,
             "model": str,
             "resolved_model": str,
+            "prompt": str,
             "input_tokens": int,
             "output_tokens": int,
             "cost_usd": float,
             "datetime_utc": str,
+            "chain_hash": str,
+            "replay_of": str,
         },
         pk="id",
     )
@@ -212,6 +218,28 @@ def test_cost_default_daily_view(cli, seeded_db: Path):
     assert "This week" in result.output
     assert "This month" in result.output
     assert "All time" in result.output
+
+
+def test_cost_top(cli, seeded_db: Path):
+    runner = CliRunner()
+    result = runner.invoke(cli, ["cost", "top", "--db", str(seeded_db), "-n", "2"])
+    assert result.exit_code == 0, result.output
+    assert "Top 2 expensive requests" in result.output
+    # Two of the three seeded rows should appear — whichever the sort picks.
+    # claude-opus-4-6 at 1M input tokens will be most expensive.
+    assert "claude-opus-4-6" in result.output
+    assert "llm-confirm-tokens" in result.output  # footer tip
+
+
+def test_cost_top_json(cli, seeded_db: Path):
+    runner = CliRunner()
+    result = runner.invoke(cli, ["cost", "top", "--db", str(seeded_db), "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["sort_by"] == "cost"
+    assert len(payload["rows"]) == 3  # three seeded responses
+    # Highest cost first
+    assert payload["rows"][0]["cost_usd"] >= payload["rows"][1]["cost_usd"]
 
 
 def test_cost_default_daily_json(cli, seeded_db: Path):

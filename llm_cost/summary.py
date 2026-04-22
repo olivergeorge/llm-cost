@@ -248,6 +248,129 @@ def _iso(dt: datetime) -> str:
 
 
 @dataclass(frozen=True)
+class ExpensiveResponse:
+    id: str
+    datetime_utc: str  # raw llm string, e.g. "2026-04-21T14:22:00.123456+00:00"
+    model: str  # canonical display name
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float  # logged if >0, else priced
+    source: str  # "logged" | "priced" | "unpriced"
+    prompt_preview: str  # single-line snippet, caller-controlled width
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+def _compact_preview(text: str, width: int) -> str:
+    """Collapse whitespace to single spaces, trim to ``width``, ellipsis if cut."""
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= width:
+        return cleaned
+    return cleaned[: max(1, width - 1)] + "…"
+
+
+def top_responses(
+    db: sqlite_utils.Database,
+    limit: int = 10,
+    by: str = "cost",
+    since: datetime | None = None,
+    until: datetime | None = None,
+    model_glob: str | None = None,
+    prices: dict[str, Price] | None = None,
+    alias_map: dict[str, str] | None = None,
+    preview_chars: int = 80,
+) -> tuple[ExpensiveResponse, ...]:
+    """Return the ``limit`` most expensive individual responses.
+
+    ``by`` picks the sort key: ``cost`` (best_cost_usd), ``input``
+    (input_tokens), ``output`` (output_tokens), or ``total``
+    (input + output).
+
+    The SQL pre-filters a larger candidate set ordered by a cheap
+    combined heuristic (logged cost + token totals); the precise cost
+    is then computed in Python per candidate using the same price-table
+    / alias-map logic as ``summarise``.
+    """
+    if by not in {"cost", "input", "output", "total"}:
+        raise ValueError(f"by must be cost/input/output/total, got {by!r}")
+    table = prices if prices is not None else default_prices()
+
+    clauses: list[str] = []
+    params: list[object] = []
+    if since is not None:
+        clauses.append("datetime_utc >= ?")
+        params.append(_iso(since))
+    if until is not None:
+        clauses.append("datetime_utc < ?")
+        params.append(_iso(until))
+    if model_glob:
+        clauses.append("model LIKE ?")
+        params.append(model_glob)
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    candidate_limit = max(limit * 20, 100)
+
+    # Prefilter in SQL by a weighted combo so we don't miss either
+    # high-cost (logged) or high-token (unlogged) candidates.
+    sql = f"""
+        SELECT
+            id, datetime_utc, model, COALESCE(resolved_model, '') AS resolved_model,
+            COALESCE(input_tokens, 0) AS input_tokens,
+            COALESCE(output_tokens, 0) AS output_tokens,
+            COALESCE(cost_usd, 0) AS logged_cost,
+            COALESCE(prompt, '') AS prompt
+        FROM responses
+        {where}
+        ORDER BY (
+            COALESCE(cost_usd, 0) * 1000
+            + COALESCE(input_tokens, 0)
+            + COALESCE(output_tokens, 0)
+        ) DESC
+        LIMIT ?
+    """
+    params.append(candidate_limit)
+
+    rows: list[ExpensiveResponse] = []
+    for row in db.execute(sql, params):
+        rid, dt, model, resolved, inp, outp, logged, prompt = row
+        key = canonical_key(model, resolved or None, alias_map)
+        price = resolve(key, None, table)
+        logged_f = float(logged)
+        if logged_f > 0:
+            cost = logged_f
+            source = "logged"
+        elif price is not None:
+            cost = price.cost(int(inp), int(outp))
+            source = "priced"
+        else:
+            cost = 0.0
+            source = "unpriced"
+        rows.append(
+            ExpensiveResponse(
+                id=rid,
+                datetime_utc=dt,
+                model=key,
+                input_tokens=int(inp),
+                output_tokens=int(outp),
+                cost_usd=cost,
+                source=source,
+                prompt_preview=_compact_preview(prompt or "", preview_chars),
+            )
+        )
+
+    sort_keys = {
+        "cost": lambda r: r.cost_usd,
+        "input": lambda r: r.input_tokens,
+        "output": lambda r: r.output_tokens,
+        "total": lambda r: r.total_tokens,
+    }
+    rows.sort(key=sort_keys[by], reverse=True)
+    return tuple(rows[:limit])
+
+
+@dataclass(frozen=True)
 class DailyRow:
     day: date
     responses: int

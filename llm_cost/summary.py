@@ -11,6 +11,10 @@ import sqlite_utils
 from .pricing import Price, _canonical, default_prices, resolve
 
 
+def _today_local() -> date:
+    return datetime.now().astimezone().date()
+
+
 @dataclass(frozen=True)
 class ModelUsage:
     model: str  # canonical display name (post alias resolution)
@@ -19,17 +23,14 @@ class ModelUsage:
     input_tokens: int
     output_tokens: int
     logged_cost_usd: float  # sum of responses.cost_usd when present
-    priced_cost_usd: float  # computed from the price table
+    priced_cost_usd: float  # priced over the group's aggregate tokens
+    best_cost_usd: float  # sum of per-subgroup (logged > 0 ? logged : priced)
     priced: bool  # False when no price was found for this model
+    source: str  # "logged" | "priced" | "mixed" | "unpriced"
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
-
-    @property
-    def best_cost_usd(self) -> float:
-        """Prefer the value llm itself logged; otherwise fall back to priced."""
-        return self.logged_cost_usd if self.logged_cost_usd > 0 else self.priced_cost_usd
 
 
 @dataclass(frozen=True)
@@ -56,7 +57,7 @@ class Summary:
 
     @property
     def has_unpriced(self) -> bool:
-        return any(not r.priced and r.logged_cost_usd == 0 for r in self.rows)
+        return any(r.source == "unpriced" for r in self.rows)
 
 
 def local_day_bounds(day: date, tz: tzinfo | None = None) -> tuple[datetime, datetime]:
@@ -156,11 +157,20 @@ def summarise(
 
     # Fold SQL rows into canonical groups in Python — the alias map lives
     # in llm's runtime registry, not the DB, so we can't express this in SQL.
+    # Per-subgroup "best cost" (logged if llm wrote one, else priced) is
+    # summed into the group so mixed groups — some subgroups logged, some
+    # unlogged — account for both halves. Without this the priced tokens
+    # from unlogged subgroups would silently drop out whenever any other
+    # subgroup had a logged value.
     groups: dict[str, dict] = {}
     for row in db.execute(sql, params):
         model, resolved, count, inp, outp, logged_cost = row
         resolved_opt = resolved or None
         key = canonical_key(model, resolved_opt, alias_map)
+        price = resolve(key, None, table)
+        subgroup_priced = price.cost(int(inp), int(outp)) if price else 0.0
+        subgroup_logged = float(logged_cost)
+        subgroup_best = subgroup_logged if subgroup_logged > 0 else subgroup_priced
         g = groups.setdefault(
             key,
             {
@@ -169,23 +179,40 @@ def summarise(
                 "input": 0,
                 "output": 0,
                 "logged": 0.0,
+                "best": 0.0,
+                "logged_subgroups": 0,
+                "priced_subgroups": 0,
+                "unpriced_subgroups": 0,
             },
         )
         g["variants"].add((model, resolved_opt))
         g["count"] += int(count)
         g["input"] += int(inp)
         g["output"] += int(outp)
-        g["logged"] += float(logged_cost)
+        g["logged"] += subgroup_logged
+        g["best"] += subgroup_best
+        if subgroup_logged > 0:
+            g["logged_subgroups"] += 1
+        elif price is not None:
+            g["priced_subgroups"] += 1
+        else:
+            g["unpriced_subgroups"] += 1
 
     rows: list[ModelUsage] = []
     for key, g in groups.items():
         price = resolve(key, None, table)
-        if price is not None:
-            priced_cost = price.cost(g["input"], g["output"])
-            priced = True
+        priced_cost = price.cost(g["input"], g["output"]) if price else 0.0
+        has_price = price is not None
+
+        if g["logged_subgroups"] and (g["priced_subgroups"] or g["unpriced_subgroups"]):
+            source = "mixed"
+        elif g["logged_subgroups"]:
+            source = "logged"
+        elif g["priced_subgroups"]:
+            source = "priced"
         else:
-            priced_cost = 0.0
-            priced = False
+            source = "unpriced"
+
         rows.append(
             ModelUsage(
                 model=key,
@@ -195,7 +222,9 @@ def summarise(
                 output_tokens=g["output"],
                 logged_cost_usd=g["logged"],
                 priced_cost_usd=priced_cost,
-                priced=priced,
+                best_cost_usd=g["best"],
+                priced=has_price,
+                source=source,
             )
         )
 
@@ -218,11 +247,135 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
+@dataclass(frozen=True)
+class DailyRow:
+    day: date
+    responses: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+
+
+@dataclass(frozen=True)
+class Headlines:
+    """Headline spend numbers for the default ``llm cost`` landing."""
+
+    today: float
+    this_week: float  # trailing 7 days inclusive of today
+    this_month: float  # calendar month-to-date
+    all_time: float
+    top_models_month: tuple[ModelUsage, ...]
+
+
+def daily_summary(
+    db: sqlite_utils.Database,
+    days: int = 14,
+    prices: dict[str, Price] | None = None,
+    alias_map: dict[str, str] | None = None,
+    today: date | None = None,
+) -> tuple[DailyRow, ...]:
+    """Per-day spend for the trailing ``days`` days (inclusive of today).
+
+    Empty days are emitted with zeros so the sparkline keeps a stable
+    width. ``today`` is injectable for tests.
+    """
+    today = today or _today_local()
+    start_day = today - timedelta(days=days - 1)
+    start_utc, _ = local_day_bounds(start_day)
+    _, end_utc = local_day_bounds(today)
+    table = prices if prices is not None else default_prices()
+
+    sql = """
+        SELECT
+            date(datetime_utc, 'localtime') AS local_date,
+            model,
+            COALESCE(resolved_model, '') AS resolved_model,
+            COUNT(*) AS n,
+            COALESCE(SUM(input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(output_tokens), 0) AS output_tokens,
+            COALESCE(SUM(cost_usd), 0) AS logged_cost
+        FROM responses
+        WHERE datetime_utc >= ? AND datetime_utc < ?
+        GROUP BY local_date, model, resolved_model
+    """
+
+    buckets: dict[str, dict] = {}
+    for row in db.execute(sql, [_iso(start_utc), _iso(end_utc)]):
+        local_date, model, resolved, n, inp, outp, logged = row
+        key = canonical_key(model, resolved or None, alias_map)
+        price = resolve(key, None, table)
+        priced_cost = price.cost(int(inp), int(outp)) if price else 0.0
+        best = float(logged) if float(logged) > 0 else priced_cost
+        b = buckets.setdefault(
+            local_date,
+            {"responses": 0, "input": 0, "output": 0, "cost": 0.0},
+        )
+        b["responses"] += int(n)
+        b["input"] += int(inp)
+        b["output"] += int(outp)
+        b["cost"] += best
+
+    rows: list[DailyRow] = []
+    d = start_day
+    while d <= today:
+        b = buckets.get(d.isoformat(), {"responses": 0, "input": 0, "output": 0, "cost": 0.0})
+        rows.append(
+            DailyRow(
+                day=d,
+                responses=b["responses"],
+                input_tokens=b["input"],
+                output_tokens=b["output"],
+                cost_usd=b["cost"],
+            )
+        )
+        d += timedelta(days=1)
+    return tuple(rows)
+
+
+def headlines(
+    db: sqlite_utils.Database,
+    prices: dict[str, Price] | None = None,
+    alias_map: dict[str, str] | None = None,
+    today: date | None = None,
+    top_n: int = 3,
+) -> Headlines:
+    """Headline totals (today / this week / this month / all time) plus
+    top-N models for the current calendar month."""
+    today = today or _today_local()
+    _, today_end = local_day_bounds(today)
+
+    today_start, _ = local_day_bounds(today)
+    week_start, _ = local_day_bounds(today - timedelta(days=6))
+    month_start, _ = local_day_bounds(today.replace(day=1))
+
+    def _cost(since):
+        return summarise(
+            db, since=since, until=today_end, prices=prices, alias_map=alias_map
+        ).total_cost_usd
+
+    month_summary = summarise(
+        db, since=month_start, until=today_end, prices=prices, alias_map=alias_map
+    )
+    all_time = summarise(db, prices=prices, alias_map=alias_map).total_cost_usd
+
+    top = tuple(
+        sorted(month_summary.rows, key=lambda r: r.best_cost_usd, reverse=True)[:top_n]
+    )
+
+    return Headlines(
+        today=_cost(today_start),
+        this_week=_cost(week_start),
+        this_month=month_summary.total_cost_usd,
+        all_time=all_time,
+        top_models_month=top,
+    )
+
+
 def models_without_prices(summary: Summary) -> Iterable[str]:
-    """Yield canonical names that had no price match and no logged cost."""
+    """Yield canonical names for groups with no price hit *and* no logged cost."""
     seen: set[str] = set()
     for row in summary.rows:
-        if row.priced or row.logged_cost_usd > 0:
+        if row.source != "unpriced":
             continue
         if row.model in seen:
             continue

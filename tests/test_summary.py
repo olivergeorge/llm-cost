@@ -233,6 +233,74 @@ def test_summarise_without_alias_map_falls_back_to_heuristic(db):
     assert s.rows[0].input_tokens == 3000
 
 
+def test_daily_summary_buckets_by_local_date(db):
+    from llm_cost.summary import daily_summary
+
+    # Two days of real spend, plus one outside the window.
+    _insert(
+        db,
+        id="d1",
+        model="anthropic/claude-opus-4-6",
+        resolved_model="claude-opus-4-6",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        cost_usd=None,
+        datetime_utc="2026-04-20T12:00:00+00:00",
+    )
+    _insert(
+        db,
+        id="d2",
+        model="anthropic/claude-opus-4-6",
+        resolved_model="claude-opus-4-6",
+        input_tokens=2_000_000,
+        output_tokens=0,
+        cost_usd=None,
+        datetime_utc="2026-04-21T12:00:00+00:00",
+    )
+    # Anchor "today" so the test is deterministic.
+    rows = daily_summary(db, days=3, today=date(2026, 4, 21))
+    # Exactly `days` rows, oldest first, empty days zero-filled.
+    assert [r.day.isoformat() for r in rows] == ["2026-04-19", "2026-04-20", "2026-04-21"]
+    assert rows[0].cost_usd == 0.0
+    assert rows[1].cost_usd == pytest.approx(5.0)  # 1M * $5/1M
+    assert rows[2].cost_usd == pytest.approx(10.0)  # 2M * $5/1M
+
+
+def test_headlines_totals(db):
+    from llm_cost.summary import headlines
+
+    # Today, within this week, within this month.
+    _insert(
+        db,
+        id="t",
+        model="anthropic/claude-opus-4-6",
+        resolved_model="claude-opus-4-6",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        cost_usd=None,
+        datetime_utc="2026-04-21T12:00:00+00:00",
+    )
+    # Last month, still in all-time.
+    _insert(
+        db,
+        id="old",
+        model="anthropic/claude-opus-4-6",
+        resolved_model="claude-opus-4-6",
+        input_tokens=2_000_000,
+        output_tokens=0,
+        cost_usd=None,
+        datetime_utc="2026-03-01T12:00:00+00:00",
+    )
+    head = headlines(db, today=date(2026, 4, 21))
+    assert head.today == pytest.approx(5.0)
+    assert head.this_week == pytest.approx(5.0)
+    assert head.this_month == pytest.approx(5.0)  # month = April only
+    assert head.all_time == pytest.approx(15.0)  # both rows
+    # Top-3 is ordered by best cost (only one model here).
+    assert len(head.top_models_month) == 1
+    assert head.top_models_month[0].model == "claude-opus-4-6"
+
+
 def test_canonical_key_prefers_alias_over_heuristic():
     amap = {"claude-haiku-4.5": "anthropic/claude-haiku-4-5-20251001"}
     # Resolved wins when it's in the alias map

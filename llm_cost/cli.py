@@ -13,7 +13,16 @@ import llm
 import sqlite_utils
 
 from .pricing import default_prices, load_prices
-from .summary import Summary, local_day_bounds, models_without_prices, summarise
+from .summary import (
+    DailyRow,
+    Headlines,
+    Summary,
+    daily_summary,
+    headlines,
+    local_day_bounds,
+    models_without_prices,
+    summarise,
+)
 
 
 def _logs_db_path() -> Path:
@@ -121,12 +130,6 @@ def _render_table(summary: Summary, label: str) -> str:
     headers = ("model", "resps", "in", "out", "cost (USD)", "source")
     rows = []
     for row in summary.rows:
-        if row.logged_cost_usd > 0:
-            source = "logged"
-        elif row.priced:
-            source = "priced"
-        else:
-            source = "unpriced"
         rows.append(
             (
                 row.model,
@@ -134,7 +137,7 @@ def _render_table(summary: Summary, label: str) -> str:
                 _format_tokens(row.input_tokens),
                 _format_tokens(row.output_tokens),
                 f"${row.best_cost_usd:,.4f}",
-                source,
+                row.source,
             )
         )
 
@@ -173,6 +176,95 @@ def _render_table(summary: Summary, label: str) -> str:
     return "\n".join(out)
 
 
+def _bar(value: float, max_value: float, width: int = 20) -> str:
+    if max_value <= 0:
+        return ""
+    fill = int(round((value / max_value) * width))
+    return "▓" * fill
+
+
+def _render_daily(days: tuple[DailyRow, ...], head: Headlines) -> str:
+    out: list[str] = []
+    if not days:
+        out.append("No responses logged yet. Run `llm prompt ...` to get started.")
+        return "\n".join(out)
+
+    max_cost = max((d.cost_usd for d in days), default=0.0)
+    bar_width = 20
+    date_w = 10
+    resps_w = max(len("resps"), *(len(str(d.responses)) for d in days))
+    cost_strs = [f"${d.cost_usd:,.4f}" for d in days]
+    cost_w = max(len("cost"), *(len(s) for s in cost_strs))
+
+    out.append(f"Spend — last {len(days)} days")
+    out.append("")
+    out.append(
+        f"{'date'.ljust(date_w)}  {'resps'.rjust(resps_w)}  "
+        f"{'cost'.rjust(cost_w)}  bar"
+    )
+    out.append(
+        f"{'-' * date_w}  {'-' * resps_w}  {'-' * cost_w}  {'-' * bar_width}"
+    )
+    for row, cost_str in zip(days, cost_strs, strict=True):
+        out.append(
+            f"{row.day.isoformat().ljust(date_w)}  "
+            f"{str(row.responses).rjust(resps_w)}  "
+            f"{cost_str.rjust(cost_w)}  "
+            f"{_bar(row.cost_usd, max_cost, bar_width)}"
+        )
+
+    out.append("")
+    label_w = len("This month")
+    out.append(f"{'Today'.ljust(label_w)}  ${head.today:,.4f}")
+    out.append(f"{'This week'.ljust(label_w)}  ${head.this_week:,.4f}  (last 7 days)")
+    out.append(f"{'This month'.ljust(label_w)}  ${head.this_month:,.4f}  (month-to-date)")
+    out.append(f"{'All time'.ljust(label_w)}  ${head.all_time:,.4f}")
+
+    if head.top_models_month:
+        out.append("")
+        out.append("Top models this month:")
+        total = sum(r.best_cost_usd for r in head.top_models_month) or 1.0
+        # Scale percentages against the month total, not the top-N subtotal,
+        # so the reader sees the true share of spend.
+        month_total = head.this_month or 1.0
+        model_w = max(len(r.model) for r in head.top_models_month)
+        for r in head.top_models_month:
+            pct = r.best_cost_usd / month_total * 100
+            out.append(f"  {r.model.ljust(model_w)}  ${r.best_cost_usd:>10,.4f}  ({pct:>4.1f}%)")
+
+    out.append("")
+    out.append(
+        "Drill down: `llm cost today` · `llm cost --since YYYY-MM-DD` · `llm cost all`"
+    )
+    return "\n".join(out)
+
+
+def _render_daily_json(days: tuple[DailyRow, ...], head: Headlines) -> str:
+    payload = {
+        "days": [
+            {
+                "day": d.day.isoformat(),
+                "responses": d.responses,
+                "input_tokens": d.input_tokens,
+                "output_tokens": d.output_tokens,
+                "cost_usd": d.cost_usd,
+            }
+            for d in days
+        ],
+        "headlines": {
+            "today": head.today,
+            "this_week": head.this_week,
+            "this_month": head.this_month,
+            "all_time": head.all_time,
+            "top_models_month": [
+                {"model": r.model, "cost_usd": r.best_cost_usd}
+                for r in head.top_models_month
+            ],
+        },
+    }
+    return json.dumps(payload, indent=2)
+
+
 def _render_json(summary: Summary, label: str) -> str:
     payload = {
         "label": label,
@@ -198,6 +290,7 @@ def _render_json(summary: Summary, label: str) -> str:
                 "priced_cost_usd": r.priced_cost_usd,
                 "best_cost_usd": r.best_cost_usd,
                 "priced": r.priced,
+                "source": r.source,
             }
             for r in summary.rows
         ],
@@ -223,8 +316,28 @@ def register_commands(cli: click.Group) -> None:
         as_json: bool,
         db_path: Path | None,
     ) -> None:
-        """Report token usage and spend from the llm logs database."""
+        """Report token usage and spend from the llm logs database.
+
+        With no arguments, renders a 14-day sparkline + today / this
+        week / this month / all-time headlines + top-3 models this
+        month. Pass --since / --until / --days for a per-model table
+        over a specific window; use `llm cost today`, `llm cost
+        yesterday`, or `llm cost all` for common shorthands.
+        """
         if ctx.invoked_subcommand is not None:
+            return
+
+        # Bare `llm cost`: the cute default landing.
+        if days is None and since is None and until is None and model_glob is None:
+            prices = _load_price_table(prices_path)
+            amap = _alias_map()
+            db = sqlite_utils.Database(str(db_path or _logs_db_path()))
+            daily = daily_summary(db, days=14, prices=prices, alias_map=amap)
+            head = headlines(db, prices=prices, alias_map=amap)
+            if as_json:
+                click.echo(_render_daily_json(daily, head))
+            else:
+                click.echo(_render_daily(daily, head))
             return
 
         if days is not None:
@@ -242,10 +355,22 @@ def register_commands(cli: click.Group) -> None:
                 parts.append(f"until {until}")
             label = " ".join(parts)
         else:
+            # Only --model passed; show all-time for that model.
             start = end = None
             label = "all time"
 
         _report(start, end, label, model_glob, prices_path, as_json, db_path)
+
+    @cost_group.command(name="all")
+    @_shared_options
+    def cost_all(
+        model_glob: str | None,
+        prices_path: Path | None,
+        as_json: bool,
+        db_path: Path | None,
+    ) -> None:
+        """Per-model spend across all logged responses (escape hatch)."""
+        _report(None, None, "all time", model_glob, prices_path, as_json, db_path)
 
     @cost_group.command(name="today")
     @_shared_options

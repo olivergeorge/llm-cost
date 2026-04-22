@@ -74,7 +74,7 @@ def cli(seeded_db: Path):
 
 def test_cost_all_time_table(cli, seeded_db: Path):
     runner = CliRunner()
-    result = runner.invoke(cli, ["cost", "--db", str(seeded_db)])
+    result = runner.invoke(cli, ["cost", "all", "--db", str(seeded_db)])
     assert result.exit_code == 0, result.output
     # Every model row surfaces
     assert "claude-opus-4-6" in result.output
@@ -91,7 +91,7 @@ def test_cost_all_time_table(cli, seeded_db: Path):
 
 def test_cost_json_output(cli, seeded_db: Path):
     runner = CliRunner()
-    result = runner.invoke(cli, ["cost", "--db", str(seeded_db), "--json"])
+    result = runner.invoke(cli, ["cost", "all", "--db", str(seeded_db), "--json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["label"] == "all time"
@@ -197,6 +197,30 @@ def test_cost_empty_db(cli, tmp_path: Path):
         pk="id",
     )
     runner = CliRunner()
-    result = runner.invoke(cli, ["cost", "--db", str(empty)])
+    result = runner.invoke(cli, ["cost", "all", "--db", str(empty)])
     assert result.exit_code == 0, result.output
     assert "No responses logged" in result.output
+
+
+def test_cost_default_daily_view(cli, seeded_db: Path):
+    """Bare `llm cost` renders the landing page: sparkline + headlines."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["cost", "--db", str(seeded_db)])
+    assert result.exit_code == 0, result.output
+    assert "Spend — last 14 days" in result.output
+    assert "Today" in result.output
+    assert "This week" in result.output
+    assert "This month" in result.output
+    assert "All time" in result.output
+
+
+def test_cost_default_daily_json(cli, seeded_db: Path):
+    runner = CliRunner()
+    result = runner.invoke(cli, ["cost", "--db", str(seeded_db), "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert len(payload["days"]) == 14
+    assert "headlines" in payload
+    assert set(payload["headlines"]) == {
+        "today", "this_week", "this_month", "all_time", "top_models_month"
+    }

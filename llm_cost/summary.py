@@ -500,8 +500,8 @@ def headlines(
 @dataclass(frozen=True)
 class DupeRow:
     model: str  # canonical
-    dupe_groups: int  # distinct request_keys where ≥2 real API calls fired
-    extra_calls: int  # total_real_calls in dupe_groups − dupe_groups
+    dupe_groups: int  # distinct fingerprints where ≥2 calls fired
+    extra_calls: int  # total calls in dupe groups − dupe_groups
     wasted_usd: float  # sum over groups of (group_total_cost − first_call_cost)
 
 
@@ -511,9 +511,7 @@ class DupeReport:
     total_groups: int
     total_extra_calls: int
     total_wasted_usd: float
-    indexed_responses: int  # responses from the window that have a replay_index row
-    total_responses: int  # total responses in the window
-    replay_index_present: bool
+    total_responses: int  # responses considered in the window
 
 
 def dupe_report(
@@ -524,91 +522,128 @@ def dupe_report(
     prices: dict[str, Price] | None = None,
     alias_map: dict[str, str] | None = None,
 ) -> DupeReport:
-    """Identify duplicate requests that could have been replayed.
+    """Identify duplicate requests by fingerprinting core request inputs.
 
-    Joins ``responses`` against ``replay_index`` (written by llm-replay)
-    on ``request_key``. A dupe group is a set of ≥2 real API calls
-    (``replay_of IS NULL``) sharing the same request_key. Savings per
-    group assume you kept the first call and replayed the rest:
-    ``sum(cost) − first_call_cost``.
+    Two calls are dupes if everything the LLM sees is identical: model,
+    system prompt, user prompt, options, schema, prior conversation
+    turns, attachments, and fragments. llm content-addresses attachments
+    (``attachments.id`` = SHA-256 of content) and fragments
+    (``fragments.hash``), so "identical file uploaded twice" folds to
+    the same key for free.
 
-    If ``replay_index`` doesn't exist (llm-replay not installed), the
-    report returns empty with ``replay_index_present=False`` so the
-    caller can advise the user.
+    The first call in a group is the one you'd keep; savings assume the
+    rest were replayed: ``sum(cost) − first_call_cost`` per group.
+
+    Uses only the core llm schema — no plugin dependency.
     """
     table = prices if prices is not None else default_prices()
 
-    total_count = _count_responses(db, since, until, model_glob)
-
-    if not db["replay_index"].exists():
-        return DupeReport(
-            rows=(),
-            total_groups=0,
-            total_extra_calls=0,
-            total_wasted_usd=0.0,
-            indexed_responses=0,
-            total_responses=total_count,
-            replay_index_present=False,
-        )
-
-    clauses = ["r.replay_of IS NULL"]
+    clauses: list[str] = []
     params: list[object] = []
     if since is not None:
-        clauses.append("r.datetime_utc >= ?")
+        clauses.append("datetime_utc >= ?")
         params.append(_iso(since))
     if until is not None:
-        clauses.append("r.datetime_utc < ?")
+        clauses.append("datetime_utc < ?")
         params.append(_iso(until))
     if model_glob:
-        clauses.append("r.model LIKE ?")
+        clauses.append("model LIKE ?")
         params.append(model_glob)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
-    where = " AND ".join(clauses)
+    total_count = _count_responses(db, since, until, model_glob)
 
-    indexed_count_sql = f"""
-        SELECT COUNT(*) FROM responses r
-        JOIN replay_index i ON i.response_id = r.id
-        WHERE {where}
-    """
-    indexed_count = next(iter(db.execute(indexed_count_sql, params)))[0]
-
-    # Pull every real-API-call row that shares a request_key with ≥1 other
-    # real-API-call row in the same window. HAVING inside the subquery is
-    # what limits us to actual dupes instead of every indexed row.
-    sql = f"""
+    # Fingerprint strategy: fetch the window rows plus the ancillary
+    # pieces (prior conversation turns, attachments, fragments) in
+    # batch queries, then assemble fingerprints in Python. Doing it in
+    # SQL via correlated subqueries is O(n²) against the full
+    # ``responses`` table on a logs.db with no conversation_id index,
+    # which takes minutes on realistic histories.
+    #
+    # Separator bytes: x'1d' between fields, x'1f' between list items,
+    # x'1e' between the (prompt, response) halves of a prior turn.
+    # Rare control bytes keep collisions theoretically possible but
+    # not practical.
+    #
+    # llm content-addresses attachments (``attachments.id`` = sha256)
+    # and fragments (``fragments.hash``), so identical-content uploads
+    # fold to the same key automatically.
+    row_sql = f"""
         SELECT
-            i.request_key,
-            r.id,
-            r.model,
-            COALESCE(r.resolved_model, '') AS resolved_model,
-            r.datetime_utc,
-            COALESCE(r.input_tokens, 0) AS input_tokens,
-            COALESCE(r.output_tokens, 0) AS output_tokens,
-            COALESCE(r.cost_usd, 0) AS logged_cost
-        FROM replay_index i
-        JOIN responses r ON r.id = i.response_id
-        WHERE {where}
-          AND i.request_key IN (
-              SELECT i2.request_key
-              FROM replay_index i2
-              JOIN responses r2 ON r2.id = i2.response_id
-              WHERE {where.replace('r.', 'r2.')}
-              GROUP BY i2.request_key
-              HAVING COUNT(*) > 1
-          )
-        ORDER BY i.request_key, r.datetime_utc
+            id, datetime_utc, conversation_id,
+            model, COALESCE(resolved_model, '') AS resolved_model,
+            COALESCE(system, '') AS system,
+            COALESCE(prompt, '') AS prompt,
+            COALESCE(options_json, '{{}}') AS options_json,
+            COALESCE(schema_id, '') AS schema_id,
+            COALESCE(input_tokens, 0) AS input_tokens,
+            COALESCE(output_tokens, 0) AS output_tokens,
+            COALESCE(cost_usd, 0.0) AS logged_cost
+        FROM responses
+        {where}
+        ORDER BY datetime_utc
     """
-    # The subquery reuses the same filters; duplicate the params list.
-    groups_by_key: dict[str, list[tuple]] = {}
-    for row in db.execute(sql, params + params):
-        key = row[0]
-        groups_by_key.setdefault(key, []).append(row)
+    window_rows = list(db.execute(row_sql, params))
+
+    # Batch-fetch prior-turn history for every conversation that has a
+    # row in the window. One scan of ``responses`` filtered to those
+    # conversation ids; we then index into the result per-row in Python.
+    # History is drawn from the full responses table (not the window)
+    # because the model saw the real history regardless of our filter.
+    priors_by_conv: dict[str, list[tuple[str, str, str]]] = {}
+    conv_ids = {r[2] for r in window_rows if r[2] is not None}
+    if conv_ids:
+        placeholders = ",".join("?" * len(conv_ids))
+        for dt, conv, prompt, response in db.execute(
+            f"""SELECT datetime_utc, conversation_id,
+                       COALESCE(prompt, ''), COALESCE(response, '')
+                FROM responses
+                WHERE conversation_id IN ({placeholders})
+                ORDER BY conversation_id, datetime_utc""",
+            list(conv_ids),
+        ):
+            priors_by_conv.setdefault(conv, []).append((dt, prompt, response))
+
+    attach_sigs = _attachment_signatures(db, [r[0] for r in window_rows])
+    pfrag_sigs = _fragment_signatures(db, "prompt_fragments", [r[0] for r in window_rows])
+    sfrag_sigs = _fragment_signatures(db, "system_fragments", [r[0] for r in window_rows])
+
+    groups_by_fp: dict[str, list[tuple]] = {}
+    for row in window_rows:
+        (
+            rid, dt, conv, model, resolved,
+            system, prompt, options, schema,
+            in_tok, out_tok, logged,
+        ) = row
+        prior_pairs = priors_by_conv.get(conv, ()) if conv is not None else ()
+        prior_blob = "\x1f".join(
+            f"{p}\x1e{r}" for pdt, p, r in prior_pairs if pdt < dt
+        )
+        fp_parts = (
+            resolved or model,
+            system,
+            prompt,
+            options,
+            schema,
+            prior_blob,
+            attach_sigs.get(rid, ""),
+            pfrag_sigs.get(rid, ""),
+            sfrag_sigs.get(rid, ""),
+        )
+        fp = "\x1d".join(fp_parts)
+        # Repack to the shape _row_cost expects: (_, _, model, resolved, _, in, out, logged)
+        groups_by_fp.setdefault(fp, []).append(
+            (rid, dt, model, resolved, None, in_tok, out_tok, logged)
+        )
 
     per_model: dict[str, dict] = {}
     total_wasted = 0.0
     total_extra = 0
-    for group in groups_by_key.values():
-        # Pick the first call (already date-sorted) — that's the "kept" one.
+    dupe_group_count = 0
+    for group in groups_by_fp.values():
+        if len(group) < 2:
+            continue
+        dupe_group_count += 1
         first = group[0]
         rest = group[1:]
         group_model = canonical_key(first[2], first[3] or None, alias_map)
@@ -642,12 +677,10 @@ def dupe_report(
 
     return DupeReport(
         rows=rows,
-        total_groups=len(groups_by_key),
+        total_groups=dupe_group_count,
         total_extra_calls=total_extra,
         total_wasted_usd=total_wasted,
-        indexed_responses=int(indexed_count),
         total_responses=total_count,
-        replay_index_present=True,
     )
 
 
@@ -658,6 +691,55 @@ def _row_cost(row: tuple, price: Price | None) -> float:
     if logged_f > 0:
         return logged_f
     return price.cost(int(inp), int(outp)) if price else 0.0
+
+
+def _attachment_signatures(
+    db: sqlite_utils.Database, response_ids: list[str]
+) -> dict[str, str]:
+    """{response_id: '|'-joined attachment ids, ordered}. Empty when the
+    ``prompt_attachments`` table isn't present on this logs.db."""
+    if not response_ids or not db["prompt_attachments"].exists():
+        return {}
+    sigs: dict[str, list[str]] = {}
+    for chunk in _chunked(response_ids, 500):
+        placeholders = ",".join("?" * len(chunk))
+        for rid, aid in db.execute(
+            f"""SELECT response_id, attachment_id
+                FROM prompt_attachments
+                WHERE response_id IN ({placeholders})
+                ORDER BY response_id, [order], attachment_id""",
+            list(chunk),
+        ):
+            sigs.setdefault(rid, []).append(aid)
+    return {rid: "|".join(ids) for rid, ids in sigs.items()}
+
+
+def _fragment_signatures(
+    db: sqlite_utils.Database, table: str, response_ids: list[str]
+) -> dict[str, str]:
+    """{response_id: '|'-joined fragment content hashes, ordered}. Keyed
+    on ``fragments.hash`` so identical-content fragments fold together
+    regardless of the local ``fragments.id`` surrogate."""
+    if not response_ids or not db[table].exists() or not db["fragments"].exists():
+        return {}
+    sigs: dict[str, list[str]] = {}
+    for chunk in _chunked(response_ids, 500):
+        placeholders = ",".join("?" * len(chunk))
+        for rid, h in db.execute(
+            f"""SELECT t.response_id, fr.hash
+                FROM {table} t
+                JOIN fragments fr ON fr.id = t.fragment_id
+                WHERE t.response_id IN ({placeholders})
+                ORDER BY t.response_id, t.[order], fr.hash""",
+            list(chunk),
+        ):
+            sigs.setdefault(rid, []).append(h)
+    return {rid: "|".join(hs) for rid, hs in sigs.items()}
+
+
+def _chunked(items: list[str], size: int) -> Iterable[list[str]]:
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
 
 def _count_responses(

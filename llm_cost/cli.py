@@ -276,23 +276,9 @@ def _local_clock(dt_iso: str) -> str:
 
 
 def _render_dupes(report: DupeReport) -> str:
-    if not report.replay_index_present:
-        return (
-            "No replay index found. Install llm-replay to track duplicate\n"
-            "requests: `llm install llm-replay` then run some prompts.\n"
-            "Future runs of `llm cost dupes` will then see the index."
-        )
-
-    header = (
-        f"Dupe spend — {report.indexed_responses} / {report.total_responses} "
-        f"responses in window are indexed"
-    )
+    header = f"Dupe spend — {report.total_responses} responses in window"
     if not report.rows:
-        return (
-            header
-            + "\n\nNo duplicate requests detected in this window. Nice.\n"
-            "(Either every request was unique, or replays kicked in already.)"
-        )
+        return header + "\n\nNo duplicate requests detected in this window. Nice."
 
     headers = ("model", "dupe-groups", "extra-calls", "wasted $")
     table_rows = [
@@ -325,18 +311,11 @@ def _render_dupes(report: DupeReport) -> str:
             ]
         )
     )
-    out.append("")
-    out.append(
-        "Tip: pass --replay to `llm prompt` (or set LLM_REPLAY=1) to replay\n"
-        "identical requests for free. See llm-replay."
-    )
     return "\n".join(out)
 
 
 def _render_dupes_json(report: DupeReport) -> str:
     payload = {
-        "replay_index_present": report.replay_index_present,
-        "indexed_responses": report.indexed_responses,
         "total_responses": report.total_responses,
         "total_groups": report.total_groups,
         "total_extra_calls": report.total_extra_calls,
@@ -565,11 +544,12 @@ def register_commands(cli: click.Group) -> None:
         as_json: bool,
         db_path: Path | None,
     ) -> None:
-        """Report duplicate requests that could have been replayed.
+        """Report duplicate requests you could have replayed.
 
-        Joins against llm-replay's ``replay_index`` to identify sets of
-        identical API calls. Savings assume you'd have kept the first
-        call and replayed the rest.
+        Fingerprints each response over its inputs (model, system,
+        prompt, options, schema, prior conversation turns, attachments,
+        fragments) and groups identical calls. Savings assume you'd
+        have kept the first call in each group and skipped the rest.
         """
         if days is not None:
             today = _today_local()

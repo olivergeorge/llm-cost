@@ -26,12 +26,15 @@ def db(tmp_path):
             "model": str,
             "resolved_model": str,
             "prompt": str,
+            "system": str,
+            "options_json": str,
+            "schema_id": str,
+            "conversation_id": str,
+            "response": str,
             "input_tokens": int,
             "output_tokens": int,
             "cost_usd": float,
             "datetime_utc": str,
-            "chain_hash": str,
-            "replay_of": str,
         },
         pk="id",
     )
@@ -381,43 +384,58 @@ def test_top_responses_prompt_preview_is_single_line(db):
     assert rows[0].prompt_preview == "line one line two tabbed line four"
 
 
-def _insert_replay_index(db, response_id: str, request_key: str):
-    if not db["replay_index"].exists():
-        db["replay_index"].create(
-            {"response_id": str, "request_key": str, "chain_hash": str},
-            pk="response_id",
+def _ensure_attachment_tables(db):
+    if not db["attachments"].exists():
+        db["attachments"].create({"id": str}, pk="id")
+    if not db["prompt_attachments"].exists():
+        db.execute(
+            "CREATE TABLE prompt_attachments ("
+            "response_id TEXT, attachment_id TEXT, [order] INTEGER,"
+            "PRIMARY KEY (response_id, attachment_id))"
         )
-    db["replay_index"].insert({
-        "response_id": response_id,
-        "request_key": request_key,
-        "chain_hash": f"ch-{response_id}",
-    })
 
 
-def test_dupe_report_missing_replay_index(db):
+def _ensure_fragment_tables(db):
+    if not db["fragments"].exists():
+        db["fragments"].create({"id": int, "hash": str}, pk="id")
+    for name in ("prompt_fragments", "system_fragments"):
+        if not db[name].exists():
+            db.execute(
+                f"CREATE TABLE {name} ("
+                "response_id TEXT, fragment_id INTEGER, [order] INTEGER,"
+                "PRIMARY KEY (response_id, fragment_id, [order]))"
+            )
+
+
+def _attach(db, response_id: str, attachment_id: str, order: int = 0):
+    _ensure_attachment_tables(db)
+    db["attachments"].insert({"id": attachment_id}, ignore=True)
+    db["prompt_attachments"].insert(
+        {"response_id": response_id, "attachment_id": attachment_id, "order": order}
+    )
+
+
+def _fragment(db, response_id: str, frag_id: int, hash_: str, order: int = 0, kind="prompt"):
+    _ensure_fragment_tables(db)
+    db["fragments"].insert({"id": frag_id, "hash": hash_}, ignore=True)
+    db[f"{kind}_fragments"].insert(
+        {"response_id": response_id, "fragment_id": frag_id, "order": order}
+    )
+
+
+def test_dupe_report_empty_db(db):
     from llm_cost.summary import dupe_report
 
-    _insert(
-        db,
-        id="r1",
-        model="anthropic/claude-opus-4-6",
-        resolved_model="claude-opus-4-6",
-        input_tokens=1000,
-        output_tokens=100,
-        cost_usd=None,
-        datetime_utc="2026-04-20T10:00:00+00:00",
-    )
     report = dupe_report(db)
-    assert report.replay_index_present is False
     assert report.rows == ()
-    assert report.total_responses == 1
-    assert report.indexed_responses == 0
+    assert report.total_responses == 0
+    assert report.total_groups == 0
 
 
 def test_dupe_report_identifies_waste(db):
+    """Three identical prompts in distinct conversations → 2 extra calls."""
     from llm_cost.summary import dupe_report
 
-    # Three real calls with the same request_key — two are dupes.
     for i, ts in enumerate(
         ["2026-04-20T10:00:00+00:00", "2026-04-20T11:00:00+00:00", "2026-04-20T12:00:00+00:00"]
     ):
@@ -426,31 +444,30 @@ def test_dupe_report_identifies_waste(db):
             id=f"dup{i}",
             model="anthropic/claude-opus-4-6",
             resolved_model="claude-opus-4-6",
+            prompt="same prompt",
+            conversation_id=f"c{i}",
             input_tokens=1_000_000,
             output_tokens=0,
             cost_usd=None,
             datetime_utc=ts,
         )
-        _insert_replay_index(db, f"dup{i}", "same-request-key")
-
-    # One unique request — shouldn't appear.
     _insert(
         db,
         id="unique",
         model="anthropic/claude-opus-4-6",
         resolved_model="claude-opus-4-6",
+        prompt="different prompt",
+        conversation_id="c-other",
         input_tokens=500_000,
         output_tokens=0,
         cost_usd=None,
         datetime_utc="2026-04-20T13:00:00+00:00",
     )
-    _insert_replay_index(db, "unique", "other-request-key")
 
     report = dupe_report(db)
-    assert report.replay_index_present is True
     assert report.total_groups == 1
-    assert report.total_extra_calls == 2  # 3 calls, 1 kept, 2 replayable
-    # Each call is 1M * $5 = $5, so 2 wasted calls = $10
+    assert report.total_extra_calls == 2
+    # Each call is 1M input * $5 = $5, so 2 wasted calls = $10
     assert report.total_wasted_usd == pytest.approx(10.0)
     assert len(report.rows) == 1
     row = report.rows[0]
@@ -459,38 +476,127 @@ def test_dupe_report_identifies_waste(db):
     assert row.extra_calls == 2
 
 
-def test_dupe_report_ignores_replays(db):
-    """Responses marked as replays (replay_of IS NOT NULL) don't count."""
+def test_dupe_report_system_prompt_breaks_fingerprint(db):
+    """Same user prompt + different system prompt → not dupes."""
     from llm_cost.summary import dupe_report
 
     _insert(
         db,
-        id="original",
+        id="a",
         model="anthropic/claude-opus-4-6",
         resolved_model="claude-opus-4-6",
-        input_tokens=1000,
-        output_tokens=0,
-        cost_usd=None,
+        prompt="hello",
+        system="be terse",
+        conversation_id="c1",
         datetime_utc="2026-04-20T10:00:00+00:00",
     )
-    # Replayed — no API call happened, shouldn't be counted as a dupe.
     _insert(
         db,
-        id="replay",
+        id="b",
         model="anthropic/claude-opus-4-6",
         resolved_model="claude-opus-4-6",
-        input_tokens=1000,
-        output_tokens=0,
-        cost_usd=None,
+        prompt="hello",
+        system="be verbose",
+        conversation_id="c2",
         datetime_utc="2026-04-20T11:00:00+00:00",
-        replay_of="original",
     )
-    _insert_replay_index(db, "original", "shared-key")
-    _insert_replay_index(db, "replay", "shared-key")
+
+    assert dupe_report(db).total_groups == 0
+
+
+def test_dupe_report_conversation_history_breaks_fingerprint(db):
+    """Same final prompt with different prior turns → not dupes."""
+    from llm_cost.summary import dupe_report
+
+    # Conversation 1: first turn "hi" → "hello", then "how are you"
+    _insert(
+        db, id="c1-t1", model="anthropic/claude-opus-4-6", resolved_model="claude-opus-4-6",
+        prompt="hi", response="hello", conversation_id="c1",
+        datetime_utc="2026-04-20T10:00:00+00:00",
+    )
+    _insert(
+        db, id="c1-t2", model="anthropic/claude-opus-4-6", resolved_model="claude-opus-4-6",
+        prompt="how are you", conversation_id="c1",
+        datetime_utc="2026-04-20T10:01:00+00:00",
+    )
+    # Conversation 2: different prior turn, then the same "how are you"
+    _insert(
+        db, id="c2-t1", model="anthropic/claude-opus-4-6", resolved_model="claude-opus-4-6",
+        prompt="yo", response="hey", conversation_id="c2",
+        datetime_utc="2026-04-20T11:00:00+00:00",
+    )
+    _insert(
+        db, id="c2-t2", model="anthropic/claude-opus-4-6", resolved_model="claude-opus-4-6",
+        prompt="how are you", conversation_id="c2",
+        datetime_utc="2026-04-20T11:01:00+00:00",
+    )
+
+    assert dupe_report(db).total_groups == 0
+
+
+def test_dupe_report_attachments_break_fingerprint(db):
+    """Same prompt + different attachment content → not dupes."""
+    from llm_cost.summary import dupe_report
+
+    _insert(
+        db, id="a", model="anthropic/claude-opus-4-6", resolved_model="claude-opus-4-6",
+        prompt="summarise this", conversation_id="c1",
+        datetime_utc="2026-04-20T10:00:00+00:00",
+    )
+    _insert(
+        db, id="b", model="anthropic/claude-opus-4-6", resolved_model="claude-opus-4-6",
+        prompt="summarise this", conversation_id="c2",
+        datetime_utc="2026-04-20T11:00:00+00:00",
+    )
+    _attach(db, "a", "hash-doc-A")
+    _attach(db, "b", "hash-doc-B")
+
+    assert dupe_report(db).total_groups == 0
+
+
+def test_dupe_report_same_attachment_is_a_dupe(db):
+    """Same prompt + same attachment content hash → dupe, even across conversations."""
+    from llm_cost.summary import dupe_report
+
+    _insert(
+        db, id="a", model="anthropic/claude-opus-4-6", resolved_model="claude-opus-4-6",
+        prompt="summarise this", conversation_id="c1",
+        input_tokens=1_000_000, output_tokens=0,
+        datetime_utc="2026-04-20T10:00:00+00:00",
+    )
+    _insert(
+        db, id="b", model="anthropic/claude-opus-4-6", resolved_model="claude-opus-4-6",
+        prompt="summarise this", conversation_id="c2",
+        input_tokens=1_000_000, output_tokens=0,
+        datetime_utc="2026-04-20T11:00:00+00:00",
+    )
+    _attach(db, "a", "shared-hash")
+    _attach(db, "b", "shared-hash")
 
     report = dupe_report(db)
-    assert report.total_groups == 0
-    assert report.total_wasted_usd == 0.0
+    assert report.total_groups == 1
+    assert report.total_extra_calls == 1
+    assert report.total_wasted_usd == pytest.approx(5.0)
+
+
+def test_dupe_report_fragments_break_fingerprint(db):
+    """Different system fragment content → not dupes."""
+    from llm_cost.summary import dupe_report
+
+    _insert(
+        db, id="a", model="anthropic/claude-opus-4-6", resolved_model="claude-opus-4-6",
+        prompt="go", conversation_id="c1",
+        datetime_utc="2026-04-20T10:00:00+00:00",
+    )
+    _insert(
+        db, id="b", model="anthropic/claude-opus-4-6", resolved_model="claude-opus-4-6",
+        prompt="go", conversation_id="c2",
+        datetime_utc="2026-04-20T11:00:00+00:00",
+    )
+    _fragment(db, "a", 1, "hash-frag-1", kind="system")
+    _fragment(db, "b", 2, "hash-frag-2", kind="system")
+
+    assert dupe_report(db).total_groups == 0
 
 
 def test_canonical_key_prefers_alias_over_heuristic():

@@ -22,12 +22,15 @@ def seeded_db(tmp_path: Path) -> Path:
             "model": str,
             "resolved_model": str,
             "prompt": str,
+            "system": str,
+            "options_json": str,
+            "schema_id": str,
+            "conversation_id": str,
+            "response": str,
             "input_tokens": int,
             "output_tokens": int,
             "cost_usd": float,
             "datetime_utc": str,
-            "chain_hash": str,
-            "replay_of": str,
         },
         pk="id",
     )
@@ -244,16 +247,16 @@ def test_cost_top_json(cli, seeded_db: Path):
     assert payload["rows"][0]["cost_usd"] >= payload["rows"][1]["cost_usd"]
 
 
-def test_cost_dupes_no_index(cli, seeded_db: Path):
+def test_cost_dupes_no_dupes(cli, seeded_db: Path):
+    """Seeded db has three distinct prompts — no dupes expected."""
     runner = CliRunner()
     result = runner.invoke(cli, ["cost", "dupes", "--db", str(seeded_db)])
     assert result.exit_code == 0, result.output
-    assert "No replay index found" in result.output
-    assert "llm-replay" in result.output
+    assert "No duplicate requests detected" in result.output
 
 
-def test_cost_dupes_with_index(cli, tmp_path: Path):
-    """Seed a small replay_index and verify the dupe report."""
+def test_cost_dupes_finds_repeats(cli, tmp_path: Path):
+    """Two identical prompts in different conversations → 1 extra call, $5 wasted."""
     path = tmp_path / "dupes.db"
     db = sqlite_utils.Database(path)
     db["responses"].create(
@@ -262,34 +265,31 @@ def test_cost_dupes_with_index(cli, tmp_path: Path):
             "model": str,
             "resolved_model": str,
             "prompt": str,
+            "system": str,
+            "options_json": str,
+            "schema_id": str,
+            "conversation_id": str,
+            "response": str,
             "input_tokens": int,
             "output_tokens": int,
             "cost_usd": float,
             "datetime_utc": str,
-            "chain_hash": str,
-            "replay_of": str,
         },
         pk="id",
     )
-    db["replay_index"].create(
-        {"response_id": str, "request_key": str, "chain_hash": str},
-        pk="response_id",
-    )
-    # Two real API calls with the same request_key.
     for i, ts in enumerate(["2026-04-20T10:00:00+00:00", "2026-04-20T11:00:00+00:00"]):
         db["responses"].insert(
             {
                 "id": f"r{i}",
                 "model": "anthropic/claude-opus-4-6",
                 "resolved_model": "claude-opus-4-6",
+                "prompt": "explain recursion",
+                "conversation_id": f"c{i}",
                 "input_tokens": 1_000_000,
                 "output_tokens": 0,
                 "cost_usd": None,
                 "datetime_utc": ts,
             }
-        )
-        db["replay_index"].insert(
-            {"response_id": f"r{i}", "request_key": "shared", "chain_hash": f"c{i}"}
         )
 
     runner = CliRunner()

@@ -183,6 +183,35 @@ my-local-model:
 Resolution order: `--prices PATH` beats `LLM_COST_PRICES` beats the
 user cache populated by `refresh-prices`.
 
+## How dupes are detected
+
+`llm cost dupes` groups responses by a fingerprint over everything the
+model sees — calls with identical fingerprints are dupes of each other.
+The fingerprint combines:
+
+- Canonical model name (so `gemini/gemini-3-flash-preview` folds into
+  `gemini-3-flash-preview`).
+- `system` and `prompt` text.
+- `options_json` (temperature, max tokens, etc.) and `schema_id`.
+- The ordered prior conversation turns — same final prompt in a
+  different chat history is a different request.
+- Attachments, joined via `prompt_attachments.attachment_id`.
+- Prompt + system fragments, joined via `fragments.hash`.
+
+Attachments and fragments are already content-addressed by `llm`
+(`attachments.id` is a SHA-256 of the file contents; `fragments.hash`
+is a SHA-256 of the fragment text), so the same file uploaded twice
+produces the same id and folds into one dupe group automatically.
+
+Savings per group assume you'd keep the first call and skip the rest:
+`sum(cost) − first_call_cost`. Costs use the logged `cost_usd` when llm
+has one, otherwise fall back to the price-table estimate.
+
+**Uses only the core llm schema** — no plugin dependency. Runs straight
+against `responses` + `prompt_attachments` + `prompt_fragments` +
+`system_fragments` + `fragments`. Scales to ~50k responses in seconds;
+if your history is huge, narrow the window with `--days` or `--since`.
+
 ## Paired plugins
 
 - [`llm-confirm-tokens`](https://github.com/olivergeorge/llm-confirm-tokens)
@@ -191,8 +220,8 @@ user cache populated by `refresh-prices`.
   similar ones in future.
 - [`llm-replay`](https://github.com/olivergeorge/llm-replay) short-circuits
   identical requests by returning the previously-logged response instead
-  of re-hitting the API. `llm cost dupes` joins against its `replay_index`
-  to show how much you'd save if you turned replay on.
+  of re-hitting the API. Pair with `llm cost dupes` to see how much that
+  would save you.
 
 ## Dev
 
@@ -230,5 +259,3 @@ Unprioritised laundry list, roughly sorted by bang-for-buck at the top:
   values using the price table, so downstream tools see consistent data.
 - `llm cost top --conversation ID` — drill into the spend of one
   specific chat session.
-- Dupe report `--since-install` flag that respects when llm-replay
-  started indexing, so the "X of Y indexed" line is less misleading.

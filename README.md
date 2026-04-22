@@ -183,6 +183,17 @@ my-local-model:
 Resolution order: `--prices PATH` beats `LLM_COST_PRICES` beats the
 user cache populated by `refresh-prices`.
 
+### Caveat: one price per model, forever
+
+The price table is a flat snapshot — there's no notion of an effective
+date, so a rate change retroactively rewrites the cost of every
+historical row for that model. Rows with a logged `cost_usd`
+(computed at call time) are unaffected; only the priced fallback
+drifts. If you care about historical accuracy, keep `cost_usd`
+populated at log time (via the fork's `after_log_to_db` hook or a
+provider plugin that writes it), or pin `--prices` to a dated file
+when reporting on old windows.
+
 ## How dupes are detected
 
 `llm cost dupes` groups responses by a fingerprint over everything the
@@ -237,6 +248,9 @@ Unprioritised laundry list, roughly sorted by bang-for-buck at the top:
 
 - `llm cost --by day` / `--by week` / `--by month` inside the per-model
   table (the default landing already does daily — this is for window reports).
+- Time-varying prices: keep dated snapshots from each `refresh-prices`
+  run and pick the one effective at each row's `datetime_utc`, so a
+  rate change doesn't retroactively rewrite historical costs.
 - CSV export (`--csv` or `--format csv`) for dropping into a spreadsheet.
 - Cached-input pricing for Gemini (LiteLLM's `cache_read_input_token_cost`
   field — currently we use the full input price).

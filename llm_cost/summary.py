@@ -609,16 +609,8 @@ def dupe_report(
         first = group[0]
         rest = group[1:]
         group_model = canonical_key(first[2], first[3] or None, alias_map)
-        price = resolve(group_model, None, table)
-
-        def _cost(row) -> float:
-            _, _, model, resolved, _, inp, outp, logged = row
-            logged_f = float(logged)
-            if logged_f > 0:
-                return logged_f
-            return price.cost(int(inp), int(outp)) if price else 0.0
-
-        wasted = sum(_cost(r) for r in rest)
+        group_price = resolve(group_model, None, table)
+        wasted = sum(_row_cost(r, group_price) for r in rest)
         bucket = per_model.setdefault(
             group_model,
             {"groups": 0, "extra_calls": 0, "wasted": 0.0},
@@ -654,6 +646,15 @@ def dupe_report(
         total_responses=total_count,
         replay_index_present=True,
     )
+
+
+def _row_cost(row: tuple, price: Price | None) -> float:
+    """Cost for a single dupe-report row: logged if > 0 else priced."""
+    _, _, _, _, _, inp, outp, logged = row
+    logged_f = float(logged)
+    if logged_f > 0:
+        return logged_f
+    return price.cost(int(inp), int(outp)) if price else 0.0
 
 
 def _count_responses(

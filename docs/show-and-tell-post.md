@@ -1,3 +1,5 @@
+# llm-cost: a post-hoc "where did my LLM spend go?" report over `llm`'s logs
+
 I wanted to know where my LLM spend was actually going without scraping dashboards across multiple providers, and `llm` already logs every request/response to SQLite — so I wrote **llm-cost**: a plugin that turns that log into token and spend reports.
 
 https://github.com/olivergeorge/llm-cost

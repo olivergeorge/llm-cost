@@ -1,0 +1,183 @@
+model: pro
+system: |
+  Concise reviewer for a Python plugin ("llm-cost") that adds a `llm cost`
+  subcommand to Simon Willison's `llm` CLI. The plugin reads llm's SQLite
+  logs (`responses` table) and reports per-model token usage and cost by
+  multiplying tokens against a LiteLLM-style price table.
+
+  Focus on: risks, simpler alternatives, blind spots Claude missed. Favour
+  plain-text bullets over decorated output. Be direct about things that are
+  wrong or over-engineered — I want disagreement, not validation.
+prompt: |
+  # Context
+
+  The plugin currently prices every input token at one rate and every
+  output token at another (see `Price` in `llm_cost/pricing.py`). LiteLLM's
+  catalog has richer per-model pricing that we ignore:
+
+    - `input_cost_per_audio_token` — 3–7× the text rate on Gemini 2.x /
+      2.5 models (e.g. `gemini-2.5-flash`: text $$0.30/M, audio $$1.00/M).
+      Not set on Gemini 3.x Pro in LiteLLM — unclear whether Google
+      actually prices 3.x Pro audio the same as text, or LiteLLM just
+      hasn't added the field yet.
+    - `input_cost_per_token_above_200k_tokens` — 2× base on Gemini 3.x Pro
+      (so $$4/M instead of $$2/M once the request crosses 200k tokens).
+    - `output_cost_per_token_above_200k_tokens` — 1.5× on 3.x Pro.
+    - `cache_read_input_token_cost` — ~10× cheaper for cached content.
+    - `output_cost_per_reasoning_token` — separate rate for
+      "thinking" / "thoughts" tokens on some Gemini models.
+
+  llm's `responses.token_details` column stores Gemini's
+  `promptTokensDetails` JSON verbatim, e.g.:
+
+      {"candidatesTokenCount": 815,
+       "promptTokensDetails": [
+         {"modality": "AUDIO", "tokenCount": 88207},
+         {"modality": "TEXT",  "tokenCount": 4713}
+       ],
+       "thoughtsTokenCount": 2048,
+       "cachedContentTokenCount": 12265}
+
+  The data we need is already on disk. We're just not reading it.
+
+  `cost_usd` is NULL for every llm-gemini row (the plugin doesn't log
+  cost), so the priced path is what drives every headline number for my
+  Gemini usage — these gaps move real totals, not edge cases.
+
+  # Proposed plan
+
+  ## A. Extend the `Price` dataclass
+
+      @dataclass(frozen=True)
+      class Price:
+          input_cost_per_token: float
+          output_cost_per_token: float
+          input_cost_per_audio_token: float | None = None
+          input_cost_per_token_above_200k: float | None = None
+          output_cost_per_token_above_200k: float | None = None
+          cache_read_input_token_cost: float | None = None
+          output_cost_per_reasoning_token: float | None = None
+
+  ## B. Introduce a `TokenBreakdown` value
+
+      @dataclass(frozen=True)
+      class TokenBreakdown:
+          input_text: int       # non-audio, non-cached input
+          input_audio: int      # modality == AUDIO
+          input_cached: int     # cachedContentTokenCount (cache read)
+          output: int           # candidatesTokenCount
+          output_reasoning: int # thoughtsTokenCount
+
+          @property
+          def input_total(self) -> int: ...
+          @property
+          def request_total(self) -> int: ...  # for tier threshold
+
+  Keep `Price.cost(input_tokens, output_tokens)` as a thin wrapper for
+  backwards compatibility — it builds a text-only `TokenBreakdown` and
+  delegates to the new `Price.cost_for(breakdown)` method.
+
+  ## C. Parse `token_details` into `TokenBreakdown`
+
+  New helper in `summary.py`:
+
+      def parse_token_details(
+          raw: str | None,
+          fallback_input: int,
+          fallback_output: int,
+      ) -> TokenBreakdown:
+
+  - Gemini shape: read `promptTokensDetails` (modality TEXT/AUDIO),
+    `cachedContentTokenCount`, `candidatesTokenCount`, `thoughtsTokenCount`.
+  - Absent / malformed / unknown shape: fall back to treating everything
+    as text input / text output using the aggregate columns.
+  - Claude-style `token_details` has a different shape (cache_creation
+    / cache_read token counts). We'd special-case when the Anthropic
+    fields appear; otherwise fall back.
+
+  ## D. Price per-response, then sum
+
+  Tier thresholds (`above_200k`) depend on the per-request input total,
+  so we cannot keep aggregating first and pricing once at the group
+  level. Shift `summarise`, `top_responses`, `daily_summary`, and
+  `dupe_report` to: SELECT per-row including `token_details`, compute
+  priced cost per row, sum into the group.
+
+  Downside: per-row pricing is O(responses) Python rather than O(groups).
+  Current `summarise` already scans every row (GROUP BY in SQL reduces
+  the Python loop, but the SQL itself still touches every row), so the
+  asymptotic change is just the per-row Python work. For my logs.db
+  (~50k responses) this should still be milliseconds.
+
+  ## E. Extend `load_prices` to read the new fields
+
+  Passthrough — each field is optional; missing → None.
+
+  ## F. Tests
+
+  - `test_pricing.py`: `Price.cost_for` with audio-only / cached-only /
+    above-200k breakdowns; unit test the bookkeeping.
+  - `test_summary.py`: a fixture row with a real Gemini
+    `token_details` payload, assert the summary cost uses audio rate
+    for the audio slice.
+
+  # Questions
+
+  A. **Per-response pricing shift.** Is the "price per row, sum into
+     group" move right, or is there a way to keep group-level aggregation
+     and handle tier thresholds correctly? I can't see one, because two
+     100k-input calls cost differently than one 200k-input call under
+     tiered pricing — but I want a second set of eyes.
+
+  B. **`thoughtsTokenCount` vs `output_tokens`.** Does `llm-gemini` log
+     `output_tokens` as `candidatesTokenCount` only, or
+     `candidatesTokenCount + thoughtsTokenCount`? If the former, we need
+     to add reasoning tokens explicitly or we undercount. If the latter,
+     pricing at `output_cost_per_token` is close but wrong when the
+     model has a separate `output_cost_per_reasoning_token`. Either way
+     we need the split from `token_details`, but the correction differs.
+
+  C. **`cachedContentTokenCount` semantics.** Is this *additive* to
+     `promptTokensDetails` totals, or *already included* in them? If
+     included, pricing cached tokens at cache-read rate means we should
+     subtract the cached count from the text input before applying
+     text rates. If additive, price it separately and don't subtract.
+     LiteLLM having a distinct `cache_read_input_token_cost` suggests
+     additive, but I want confirmation.
+
+  D. **Gemini 3.x Pro audio.** LiteLLM has no `input_cost_per_audio_token`
+     for `gemini-3-pro-preview` / `gemini-3.1-pro-preview`, so we'd
+     fall back to text rate. Is that correct (Google unified 3.x Pro
+     pricing) or a LiteLLM gap? If the latter, how should we signal
+     uncertainty to the user — unpriced-audio bucket, warning row, or
+     silent fall-through?
+
+  E. **Other providers.** Anthropic and OpenAI models also have richer
+     pricing in LiteLLM (cache creation/read for Claude, audio for
+     gpt-4o-audio, etc.). Is it worth generalising `TokenBreakdown`
+     past the Gemini shape in this pass, or ship Gemini-first and
+     extend later? My instinct is Gemini-first: the data shape in
+     `token_details` varies per provider and speculating on Claude's
+     without a real log payload to test against is asking for bugs.
+
+  F. **Fallback when `token_details` is absent.** Current plan: treat
+     every input token as text. Alternative: look at the model name and
+     best-effort guess (e.g. for Gemini 2.5 we *know* if audio was sent
+     it'd be in `token_details`, so absence implies pure-text). Is the
+     simpler fallback fine, or are there logs where we'll badly
+     misprice?
+
+  G. **Anything else I've missed?** Blind spots, simpler phrasings,
+     places where this over-engineers vs the user value of "know how
+     much Gemini audio calls cost me". I'd rather ship a smaller correct
+     thing than a big architectural change that isn't warranted.
+
+  The files below are the full current code (`pricing.py`, `summary.py`),
+  their tests, and the README for project-level context. Read
+  `pricing.py` and `summary.py` first — the plan touches both directly.
+fragments:
+  - /Users/olivergeorge/repos/olivergeorge/llm-cost/llm_cost/pricing.py
+  - /Users/olivergeorge/repos/olivergeorge/llm-cost/llm_cost/summary.py
+  - /Users/olivergeorge/repos/olivergeorge/llm-cost/tests/test_pricing.py
+  - /Users/olivergeorge/repos/olivergeorge/llm-cost/tests/test_summary.py
+  - /Users/olivergeorge/repos/olivergeorge/llm-cost/README.md

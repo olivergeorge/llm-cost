@@ -44,21 +44,105 @@ import yaml
 
 
 @dataclass(frozen=True)
+class TokenBreakdown:
+    """Disjoint per-bucket token counts for a single response.
+
+    Invariants assumed by :meth:`Price.cost_for`:
+
+    - ``input_text + input_audio + input_cached`` == row's ``input_tokens``
+    - ``output + output_reasoning`` == row's ``output_tokens``
+
+    Cached tokens are broken out separately because providers charge a
+    discounted rate for cache-reads; reasoning ("thoughts") tokens are
+    broken out because some models charge a distinct reasoning rate.
+    ``parse_token_details`` in :mod:`llm_cost.summary` builds these from
+    the provider-native ``token_details`` payload; callers without
+    per-modality info construct a text-only breakdown with
+    :meth:`text_only`.
+    """
+
+    input_text: int
+    input_audio: int
+    input_cached: int
+    output: int
+    output_reasoning: int
+
+    @classmethod
+    def text_only(cls, input_tokens: int, output_tokens: int) -> "TokenBreakdown":
+        return cls(
+            input_text=input_tokens,
+            input_audio=0,
+            input_cached=0,
+            output=output_tokens,
+            output_reasoning=0,
+        )
+
+    def __add__(self, other: "TokenBreakdown") -> "TokenBreakdown":
+        return TokenBreakdown(
+            input_text=self.input_text + other.input_text,
+            input_audio=self.input_audio + other.input_audio,
+            input_cached=self.input_cached + other.input_cached,
+            output=self.output + other.output,
+            output_reasoning=self.output_reasoning + other.output_reasoning,
+        )
+
+
+@dataclass(frozen=True)
 class Price:
     """Per-token USD cost for a model.
 
-    Stored per-token to match LiteLLM's schema. Multiply by token counts
-    directly in :meth:`cost`; no divide-by-a-million dance at the call
-    site.
+    Stored per-token to match LiteLLM's schema. The base fields
+    (``input_cost_per_token`` / ``output_cost_per_token``) are required;
+    the rest are optional per-bucket rates that fall back to the base
+    when absent:
+
+    - ``input_cost_per_audio_token`` — Gemini 2.x charges 3–7× more for
+      audio input than text. Not set on Gemini 3.x Pro (Google unified
+      the price). Falls back to ``input_cost_per_token``.
+    - ``cache_read_input_token_cost`` — roughly 10× cheaper for content
+      served from a prompt cache.
+    - ``output_cost_per_reasoning_token`` — some Gemini models publish a
+      distinct rate for "thoughts"/reasoning tokens. Where absent,
+      reasoning is priced at ``output_cost_per_token``.
     """
 
     input_cost_per_token: float
     output_cost_per_token: float
+    input_cost_per_audio_token: float | None = None
+    cache_read_input_token_cost: float | None = None
+    output_cost_per_reasoning_token: float | None = None
 
     def cost(self, input_tokens: int, output_tokens: int) -> float:
+        """Cost for a text-only response.
+
+        Thin wrapper over :meth:`cost_for` for callers that don't have a
+        per-modality breakdown. Treats every input token as text and
+        every output token as non-reasoning.
+        """
+        return self.cost_for(TokenBreakdown.text_only(input_tokens, output_tokens))
+
+    def cost_for(self, breakdown: TokenBreakdown) -> float:
+        audio_rate = (
+            self.input_cost_per_audio_token
+            if self.input_cost_per_audio_token is not None
+            else self.input_cost_per_token
+        )
+        cache_rate = (
+            self.cache_read_input_token_cost
+            if self.cache_read_input_token_cost is not None
+            else self.input_cost_per_token
+        )
+        reasoning_rate = (
+            self.output_cost_per_reasoning_token
+            if self.output_cost_per_reasoning_token is not None
+            else self.output_cost_per_token
+        )
         return (
-            input_tokens * self.input_cost_per_token
-            + output_tokens * self.output_cost_per_token
+            breakdown.input_text * self.input_cost_per_token
+            + breakdown.input_audio * audio_rate
+            + breakdown.input_cached * cache_rate
+            + breakdown.output * self.output_cost_per_token
+            + breakdown.output_reasoning * reasoning_rate
         )
 
 
@@ -113,7 +197,16 @@ def load_prices(path: Path | str) -> dict[str, Price]:
         outp = spec.get("output_cost_per_token")
         if inp is None or outp is None:
             continue
-        out[_canonical(name)] = Price(float(inp), float(outp))
+        audio = spec.get("input_cost_per_audio_token")
+        cache_read = spec.get("cache_read_input_token_cost")
+        reasoning = spec.get("output_cost_per_reasoning_token")
+        out[_canonical(name)] = Price(
+            input_cost_per_token=float(inp),
+            output_cost_per_token=float(outp),
+            input_cost_per_audio_token=float(audio) if audio is not None else None,
+            cache_read_input_token_cost=float(cache_read) if cache_read is not None else None,
+            output_cost_per_reasoning_token=float(reasoning) if reasoning is not None else None,
+        )
     return out
 
 

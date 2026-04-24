@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 
 import sqlite_utils
 
-from .pricing import Price, _canonical, default_prices, resolve
+from .pricing import Price, TokenBreakdown, _canonical, default_prices, resolve
 
 
 def _today_local() -> date:
@@ -73,6 +74,105 @@ def local_day_bounds(day: date, tz: tzinfo | None = None) -> tuple[datetime, dat
     start_local = datetime.combine(day, time.min, tzinfo=tz)
     end_local = start_local + timedelta(days=1)
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def parse_token_details(
+    raw: str | None,
+    input_tokens: int,
+    output_tokens: int,
+) -> TokenBreakdown:
+    """Split ``input_tokens`` / ``output_tokens`` into per-bucket counts.
+
+    Recognises the Gemini ``token_details`` payload that ``llm-gemini``
+    writes into ``responses.token_details``. Example::
+
+        {"candidatesTokenCount": 1189,
+         "cachedContentTokenCount": 12265,
+         "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 16342}],
+         "cacheTokensDetails":  [{"modality": "TEXT", "tokenCount": 12265}],
+         "thoughtsTokenCount": 790}
+
+    Bucketing rules (empirically verified against live logs):
+
+    - ``input_tokens`` column ≡ ``sum(promptTokensDetails.tokenCount)``
+      + ``toolUsePromptTokenCount``. Cached tokens are a **subset** of
+      ``promptTokensDetails``, not additive.
+    - ``output_tokens`` column ≡ ``candidatesTokenCount`` +
+      ``thoughtsTokenCount``.
+
+    The parser therefore subtracts cached from the matching modality
+    (via ``cacheTokensDetails``) so we don't double-count, and treats
+    tool-use prompt tokens as text. When ``raw`` is ``None``, empty,
+    malformed, or of an unknown shape, falls back to
+    :meth:`TokenBreakdown.text_only` using the aggregate columns.
+    """
+    if not raw:
+        return TokenBreakdown.text_only(input_tokens, output_tokens)
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return TokenBreakdown.text_only(input_tokens, output_tokens)
+    if not isinstance(data, dict):
+        return TokenBreakdown.text_only(input_tokens, output_tokens)
+
+    # Only the Gemini shape is modelled right now. Other providers (or
+    # future fields we don't recognise) fall through to text-only.
+    has_gemini_fields = any(
+        k in data
+        for k in ("promptTokensDetails", "candidatesTokenCount", "thoughtsTokenCount")
+    )
+    if not has_gemini_fields:
+        return TokenBreakdown.text_only(input_tokens, output_tokens)
+
+    text = 0
+    audio = 0
+    for entry in data.get("promptTokensDetails") or ():
+        if not isinstance(entry, dict):
+            continue
+        tokens = int(entry.get("tokenCount") or 0)
+        modality = str(entry.get("modality") or "TEXT").upper()
+        if modality == "AUDIO":
+            audio += tokens
+        else:
+            # TEXT, IMAGE, VIDEO — price as text. LiteLLM doesn't yet
+            # publish per-modality rates for images/video on Gemini.
+            text += tokens
+
+    # Tool-use prompt tokens aren't broken down by modality. Treat as text.
+    text += int(data.get("toolUsePromptTokenCount") or 0)
+
+    cached_total = int(data.get("cachedContentTokenCount") or 0)
+    cached_audio = 0
+    for entry in data.get("cacheTokensDetails") or ():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("modality") or "TEXT").upper() == "AUDIO":
+            cached_audio += int(entry.get("tokenCount") or 0)
+    cached_text = cached_total - cached_audio
+    # Cached tokens are a subset of promptTokensDetails — subtract so we
+    # don't double-count them under both a modality bucket and the
+    # cache bucket.
+    text = max(0, text - cached_text)
+    audio = max(0, audio - cached_audio)
+
+    # Reconcile against the authoritative aggregate column: if our
+    # computed total differs (unknown field, malformed entry), absorb
+    # the residual into text so the bucket sum still matches
+    # ``input_tokens`` exactly.
+    residual = input_tokens - (text + audio + cached_total)
+    if residual:
+        text = max(0, text + residual)
+
+    reasoning = int(data.get("thoughtsTokenCount") or 0)
+    base_output = max(0, output_tokens - reasoning)
+
+    return TokenBreakdown(
+        input_text=text,
+        input_audio=audio,
+        input_cached=cached_total,
+        output=base_output,
+        output_reasoning=reasoning,
+    )
 
 
 def canonical_key(
@@ -142,35 +242,33 @@ def summarise(
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
+    # Per-row fetch: we need ``token_details`` to split input/output into
+    # text/audio/cached/reasoning buckets. SQL-side aggregation can't
+    # express that split cleanly (the audio count is nested inside a
+    # JSON array), so we aggregate in Python. For typical logs.db sizes
+    # this is still milliseconds.
     sql = f"""
         SELECT
             model,
             COALESCE(resolved_model, '') AS resolved_model,
-            COUNT(*) AS response_count,
-            COALESCE(SUM(input_tokens), 0) AS input_tokens,
-            COALESCE(SUM(output_tokens), 0) AS output_tokens,
-            COALESCE(SUM(cost_usd), 0) AS logged_cost_usd
+            COALESCE(input_tokens, 0) AS input_tokens,
+            COALESCE(output_tokens, 0) AS output_tokens,
+            COALESCE(cost_usd, 0) AS logged_cost_usd,
+            token_details
         FROM responses
         {where}
-        GROUP BY model, resolved_model
     """
 
-    # Fold SQL rows into canonical groups in Python — the alias map lives
-    # in llm's runtime registry, not the DB, so we can't express this in SQL.
-    # Per-subgroup "best cost" (logged if llm wrote one, else priced) is
-    # summed into the group so mixed groups — some subgroups logged, some
-    # unlogged — account for both halves. Without this the priced tokens
-    # from unlogged subgroups would silently drop out whenever any other
-    # subgroup had a logged value.
     groups: dict[str, dict] = {}
     for row in db.execute(sql, params):
-        model, resolved, count, inp, outp, logged_cost = row
+        model, resolved, inp, outp, logged_cost, token_details = row
         resolved_opt = resolved or None
         key = canonical_key(model, resolved_opt, alias_map)
         price = resolve(key, None, table)
-        subgroup_priced = price.cost(int(inp), int(outp)) if price else 0.0
-        subgroup_logged = float(logged_cost)
-        subgroup_best = subgroup_logged if subgroup_logged > 0 else subgroup_priced
+        breakdown = parse_token_details(token_details, int(inp), int(outp))
+        row_priced = price.cost_for(breakdown) if price else 0.0
+        row_logged = float(logged_cost)
+        row_best = row_logged if row_logged > 0 else row_priced
         g = groups.setdefault(
             key,
             {
@@ -178,37 +276,39 @@ def summarise(
                 "count": 0,
                 "input": 0,
                 "output": 0,
+                "breakdown": TokenBreakdown(0, 0, 0, 0, 0),
                 "logged": 0.0,
                 "best": 0.0,
-                "logged_subgroups": 0,
-                "priced_subgroups": 0,
-                "unpriced_subgroups": 0,
+                "logged_rows": 0,
+                "priced_rows": 0,
+                "unpriced_rows": 0,
             },
         )
         g["variants"].add((model, resolved_opt))
-        g["count"] += int(count)
+        g["count"] += 1
         g["input"] += int(inp)
         g["output"] += int(outp)
-        g["logged"] += subgroup_logged
-        g["best"] += subgroup_best
-        if subgroup_logged > 0:
-            g["logged_subgroups"] += 1
+        g["breakdown"] = g["breakdown"] + breakdown
+        g["logged"] += row_logged
+        g["best"] += row_best
+        if row_logged > 0:
+            g["logged_rows"] += 1
         elif price is not None:
-            g["priced_subgroups"] += 1
+            g["priced_rows"] += 1
         else:
-            g["unpriced_subgroups"] += 1
+            g["unpriced_rows"] += 1
 
     rows: list[ModelUsage] = []
     for key, g in groups.items():
         price = resolve(key, None, table)
-        priced_cost = price.cost(g["input"], g["output"]) if price else 0.0
+        priced_cost = price.cost_for(g["breakdown"]) if price else 0.0
         has_price = price is not None
 
-        if g["logged_subgroups"] and (g["priced_subgroups"] or g["unpriced_subgroups"]):
+        if g["logged_rows"] and (g["priced_rows"] or g["unpriced_rows"]):
             source = "mixed"
-        elif g["logged_subgroups"]:
+        elif g["logged_rows"]:
             source = "logged"
-        elif g["priced_subgroups"]:
+        elif g["priced_rows"]:
             source = "priced"
         else:
             source = "unpriced"
@@ -228,7 +328,6 @@ def summarise(
             )
         )
 
-    # Highest token volume first, matching the old SQL ORDER BY.
     rows.sort(key=lambda r: r.input_tokens + r.output_tokens, reverse=True)
 
     return Summary(since_utc=since, until_utc=until, rows=tuple(rows))
@@ -320,7 +419,8 @@ def top_responses(
             COALESCE(input_tokens, 0) AS input_tokens,
             COALESCE(output_tokens, 0) AS output_tokens,
             COALESCE(cost_usd, 0) AS logged_cost,
-            COALESCE(prompt, '') AS prompt
+            COALESCE(prompt, '') AS prompt,
+            token_details
         FROM responses
         {where}
         ORDER BY (
@@ -334,7 +434,7 @@ def top_responses(
 
     rows: list[ExpensiveResponse] = []
     for row in db.execute(sql, params):
-        rid, dt, model, resolved, inp, outp, logged, prompt = row
+        rid, dt, model, resolved, inp, outp, logged, prompt, token_details = row
         key = canonical_key(model, resolved or None, alias_map)
         price = resolve(key, None, table)
         logged_f = float(logged)
@@ -342,7 +442,8 @@ def top_responses(
             cost = logged_f
             source = "logged"
         elif price is not None:
-            cost = price.cost(int(inp), int(outp))
+            breakdown = parse_token_details(token_details, int(inp), int(outp))
+            cost = price.cost_for(breakdown)
             source = "priced"
         else:
             cost = 0.0
@@ -408,32 +509,38 @@ def daily_summary(
     _, end_utc = local_day_bounds(today)
     table = prices if prices is not None else default_prices()
 
+    # Per-row fetch so we can split audio/cached via token_details.
+    # `date(datetime_utc, 'localtime')` is computed in SQL so timezone
+    # handling matches the prior grouping semantics.
     sql = """
         SELECT
             date(datetime_utc, 'localtime') AS local_date,
             model,
             COALESCE(resolved_model, '') AS resolved_model,
-            COUNT(*) AS n,
-            COALESCE(SUM(input_tokens), 0) AS input_tokens,
-            COALESCE(SUM(output_tokens), 0) AS output_tokens,
-            COALESCE(SUM(cost_usd), 0) AS logged_cost
+            COALESCE(input_tokens, 0) AS input_tokens,
+            COALESCE(output_tokens, 0) AS output_tokens,
+            COALESCE(cost_usd, 0) AS logged_cost,
+            token_details
         FROM responses
         WHERE datetime_utc >= ? AND datetime_utc < ?
-        GROUP BY local_date, model, resolved_model
     """
 
     buckets: dict[str, dict] = {}
     for row in db.execute(sql, [_iso(start_utc), _iso(end_utc)]):
-        local_date, model, resolved, n, inp, outp, logged = row
+        local_date, model, resolved, inp, outp, logged, token_details = row
         key = canonical_key(model, resolved or None, alias_map)
         price = resolve(key, None, table)
-        priced_cost = price.cost(int(inp), int(outp)) if price else 0.0
+        if price:
+            breakdown = parse_token_details(token_details, int(inp), int(outp))
+            priced_cost = price.cost_for(breakdown)
+        else:
+            priced_cost = 0.0
         best = float(logged) if float(logged) > 0 else priced_cost
         b = buckets.setdefault(
             local_date,
             {"responses": 0, "input": 0, "output": 0, "cost": 0.0},
         )
-        b["responses"] += int(n)
+        b["responses"] += 1
         b["input"] += int(inp)
         b["output"] += int(outp)
         b["cost"] += best
@@ -578,7 +685,8 @@ def dupe_report(
             COALESCE(schema_id, '') AS schema_id,
             COALESCE(input_tokens, 0) AS input_tokens,
             COALESCE(output_tokens, 0) AS output_tokens,
-            COALESCE(cost_usd, 0.0) AS logged_cost
+            COALESCE(cost_usd, 0.0) AS logged_cost,
+            token_details
         FROM responses
         {where}
         ORDER BY datetime_utc
@@ -613,7 +721,7 @@ def dupe_report(
         (
             rid, dt, conv, model, resolved,
             system, prompt, options, schema,
-            in_tok, out_tok, logged,
+            in_tok, out_tok, logged, token_details,
         ) = row
         prior_pairs = priors_by_conv.get(conv, ()) if conv is not None else ()
         prior_blob = "\x1f".join(
@@ -631,9 +739,9 @@ def dupe_report(
             sfrag_sigs.get(rid, ""),
         )
         fp = "\x1d".join(fp_parts)
-        # Repack to the shape _row_cost expects: (_, _, model, resolved, _, in, out, logged)
+        # Repack to the shape _row_cost expects: (_, _, model, resolved, _, in, out, logged, token_details)
         groups_by_fp.setdefault(fp, []).append(
-            (rid, dt, model, resolved, None, in_tok, out_tok, logged)
+            (rid, dt, model, resolved, None, in_tok, out_tok, logged, token_details)
         )
 
     per_model: dict[str, dict] = {}
@@ -686,11 +794,14 @@ def dupe_report(
 
 def _row_cost(row: tuple, price: Price | None) -> float:
     """Cost for a single dupe-report row: logged if > 0 else priced."""
-    _, _, _, _, _, inp, outp, logged = row
+    _, _, _, _, _, inp, outp, logged, token_details = row
     logged_f = float(logged)
     if logged_f > 0:
         return logged_f
-    return price.cost(int(inp), int(outp)) if price else 0.0
+    if price is None:
+        return 0.0
+    breakdown = parse_token_details(token_details, int(inp), int(outp))
+    return price.cost_for(breakdown)
 
 
 def _attachment_signatures(

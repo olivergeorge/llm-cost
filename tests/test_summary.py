@@ -6,11 +6,14 @@ from zoneinfo import ZoneInfo
 import pytest
 import sqlite_utils
 
-from llm_cost.pricing import Price
+import json
+
+from llm_cost.pricing import Price, TokenBreakdown
 from llm_cost.summary import (
     canonical_key,
     local_day_bounds,
     models_without_prices,
+    parse_token_details,
     summarise,
 )
 
@@ -33,6 +36,7 @@ def db(tmp_path):
             "response": str,
             "input_tokens": int,
             "output_tokens": int,
+            "token_details": str,
             "cost_usd": float,
             "datetime_utc": str,
         },
@@ -627,6 +631,124 @@ def test_summarise_honours_custom_prices(db):
     # LiteLLM-aligned schema the loader now expects).
     s = summarise(db, prices={"my-local-model": Price(0.01 / 1_000_000, 0.02 / 1_000_000)})
     assert s.rows[0].priced_cost_usd == pytest.approx(0.01)
+
+
+def test_parse_token_details_none_is_text_only():
+    assert parse_token_details(None, 1000, 200) == TokenBreakdown.text_only(1000, 200)
+    assert parse_token_details("", 1000, 200) == TokenBreakdown.text_only(1000, 200)
+
+
+def test_parse_token_details_malformed_falls_back():
+    assert parse_token_details("not json", 500, 100) == TokenBreakdown.text_only(500, 100)
+
+
+def test_parse_token_details_unknown_shape_falls_back():
+    """Shapes we don't model (e.g. a hypothetical provider) keep text-only math."""
+    payload = json.dumps({"totally_unrelated_field": 42})
+    assert parse_token_details(payload, 500, 100) == TokenBreakdown.text_only(500, 100)
+
+
+def test_parse_token_details_gemini_audio_plus_cache():
+    """Real Gemini payload: audio-heavy, cache hit, reasoning tokens."""
+    payload = json.dumps(
+        {
+            "candidatesTokenCount": 815,
+            "cachedContentTokenCount": 4000,
+            "promptTokensDetails": [
+                {"modality": "AUDIO", "tokenCount": 88207},
+                {"modality": "TEXT", "tokenCount": 4713},
+            ],
+            "cacheTokensDetails": [{"modality": "TEXT", "tokenCount": 4000}],
+            "thoughtsTokenCount": 2048,
+        }
+    )
+    # input_tokens == 88207 + 4713 = 92920, output_tokens == 815 + 2048 = 2863.
+    b = parse_token_details(payload, 92920, 2863)
+    # Cache (4000 TEXT) subtracts from text, leaving 713 pure text.
+    assert b.input_text == 713
+    assert b.input_audio == 88207
+    assert b.input_cached == 4000
+    assert b.output == 815
+    assert b.output_reasoning == 2048
+    # Invariant: buckets sum back to the aggregate columns.
+    assert b.input_text + b.input_audio + b.input_cached == 92920
+    assert b.output + b.output_reasoning == 2863
+
+
+def test_parse_token_details_tool_use_tokens_are_text():
+    """toolUsePromptTokenCount pushes input_tokens above promptTokensDetails sum."""
+    payload = json.dumps(
+        {
+            "candidatesTokenCount": 1270,
+            "cachedContentTokenCount": 6387,
+            "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 12286}],
+            "cacheTokensDetails": [{"modality": "TEXT", "tokenCount": 6387}],
+            "toolUsePromptTokenCount": 15644,
+            "thoughtsTokenCount": 6736,
+        }
+    )
+    # input_tokens = 12286 (prompt) + 15644 (tool-use) = 27930.
+    b = parse_token_details(payload, 27930, 8006)
+    # 12286 text − 6387 cached + 15644 tool-use = 21543 text.
+    assert b.input_text == 21543
+    assert b.input_audio == 0
+    assert b.input_cached == 6387
+    assert b.input_text + b.input_audio + b.input_cached == 27930
+
+
+def test_summarise_prices_gemini_audio_at_audio_rate(db):
+    """End-to-end: an audio-heavy Gemini row uses the audio rate."""
+    _insert(
+        db,
+        model="gemini/gemini-2.5-flash",
+        resolved_model="gemini-2.5-flash",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        token_details=json.dumps(
+            {
+                "promptTokensDetails": [
+                    {"modality": "AUDIO", "tokenCount": 1_000_000},
+                ],
+                "candidatesTokenCount": 0,
+            }
+        ),
+        cost_usd=None,
+        datetime_utc="2026-04-20T10:00:00+00:00",
+    )
+    s = summarise(db)
+    # Conftest fixture prices gemini-2.5-flash audio at $1/M — if we were
+    # still treating audio as text it'd price at $0.30/M. Assert the
+    # audio rate lands.
+    assert s.rows[0].priced_cost_usd == pytest.approx(1.0)
+
+
+def test_summarise_prices_cached_tokens_at_cache_rate(db):
+    """End-to-end: cached tokens priced at the cheap cache-read rate."""
+    _insert(
+        db,
+        model="gemini/gemini-2.5-flash",
+        resolved_model="gemini-2.5-flash",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        token_details=json.dumps(
+            {
+                "cachedContentTokenCount": 1_000_000,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 1_000_000},
+                ],
+                "cacheTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 1_000_000},
+                ],
+                "candidatesTokenCount": 0,
+            }
+        ),
+        cost_usd=None,
+        datetime_utc="2026-04-20T10:00:00+00:00",
+    )
+    s = summarise(db)
+    # All input is cached → $0.03/M rate. Without this fix the same
+    # tokens would price at $0.30/M — 10× too expensive.
+    assert s.rows[0].priced_cost_usd == pytest.approx(0.03)
 
 
 def test_local_day_bounds_brisbane_tz():

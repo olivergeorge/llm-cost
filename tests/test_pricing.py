@@ -8,6 +8,7 @@ import pytest
 from llm_cost import pricing
 from llm_cost.pricing import (
     Price,
+    TokenBreakdown,
     _canonical,
     default_prices,
     load_prices,
@@ -20,6 +21,19 @@ from llm_cost.pricing import (
 # tests readable at the call site.
 def _m(input_per_m: float, output_per_m: float) -> Price:
     return Price(input_per_m / 1_000_000, output_per_m / 1_000_000)
+
+
+def _rich(input_per_m, output_per_m, audio_per_m=None, cache_per_m=None, reasoning_per_m=None):
+    """Build a Price with optional audio/cache/reasoning rates set."""
+    def per_token(v):
+        return None if v is None else v / 1_000_000
+    return Price(
+        input_cost_per_token=input_per_m / 1_000_000,
+        output_cost_per_token=output_per_m / 1_000_000,
+        input_cost_per_audio_token=per_token(audio_per_m),
+        cache_read_input_token_cost=per_token(cache_per_m),
+        output_cost_per_reasoning_token=per_token(reasoning_per_m),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -51,6 +65,88 @@ def test_price_cost_multiplies_per_token():
     assert p.cost(1_000_000, 0) == pytest.approx(2.5)
     assert p.cost(0, 1_000_000) == pytest.approx(15.0)
     assert p.cost(500_000, 200_000) == pytest.approx(2.5 * 0.5 + 15.0 * 0.2)
+
+
+def test_cost_for_prices_audio_at_audio_rate():
+    # Gemini 2.5 flash shape: text $0.30/M, audio $1.00/M.
+    p = _rich(0.3, 2.5, audio_per_m=1.0)
+    breakdown = TokenBreakdown(
+        input_text=100_000, input_audio=1_000_000, input_cached=0,
+        output=0, output_reasoning=0,
+    )
+    # text: 100k * $0.30/M = $0.03; audio: 1M * $1.00/M = $1.00
+    assert p.cost_for(breakdown) == pytest.approx(0.03 + 1.0)
+
+
+def test_cost_for_audio_falls_back_to_text_rate_when_unset():
+    # Gemini 3.x Pro: LiteLLM doesn't publish a separate audio rate, so
+    # audio should price at the text rate without a warning.
+    p = _rich(2.0, 12.0)  # no audio rate
+    breakdown = TokenBreakdown(
+        input_text=0, input_audio=500_000, input_cached=0,
+        output=0, output_reasoning=0,
+    )
+    assert p.cost_for(breakdown) == pytest.approx(1.0)  # 500k * $2/M
+
+
+def test_cost_for_cache_read_at_discounted_rate():
+    p = _rich(0.3, 2.5, cache_per_m=0.03)  # cache is 10× cheaper
+    breakdown = TokenBreakdown(
+        input_text=0, input_audio=0, input_cached=1_000_000,
+        output=0, output_reasoning=0,
+    )
+    assert p.cost_for(breakdown) == pytest.approx(0.03)
+
+
+def test_cost_for_reasoning_falls_back_to_output_rate():
+    p = _rich(0.3, 2.5)  # no distinct reasoning rate
+    breakdown = TokenBreakdown(
+        input_text=0, input_audio=0, input_cached=0,
+        output=1000, output_reasoning=2000,
+    )
+    # 3k total output at $2.50/M
+    assert p.cost_for(breakdown) == pytest.approx(3_000 * 2.5 / 1_000_000)
+
+
+def test_cost_is_cost_for_text_only_equivalent():
+    """The legacy cost(input, output) API is a text-only wrapper."""
+    p = _rich(0.3, 2.5, audio_per_m=1.0, cache_per_m=0.03)
+    # Same numbers going through both APIs — the breakdown-free call
+    # must produce the same result as an explicit text-only breakdown.
+    via_cost = p.cost(1_000_000, 500_000)
+    via_cost_for = p.cost_for(TokenBreakdown.text_only(1_000_000, 500_000))
+    assert via_cost == via_cost_for
+
+
+def test_load_prices_reads_optional_audio_and_cache_fields(tmp_path: Path):
+    path = tmp_path / "p.yaml"
+    path.write_text(
+        json.dumps(
+            {
+                "gemini-2.5-flash": {
+                    "input_cost_per_token": 3e-7,
+                    "output_cost_per_token": 2.5e-6,
+                    "input_cost_per_audio_token": 1e-6,
+                    "cache_read_input_token_cost": 3e-8,
+                    "output_cost_per_reasoning_token": 2.5e-6,
+                },
+                "plain-model": {
+                    "input_cost_per_token": 1e-6,
+                    "output_cost_per_token": 5e-6,
+                },
+            }
+        )
+    )
+    table = load_prices(path)
+    rich = table["gemini-2.5-flash"]
+    assert rich.input_cost_per_audio_token == pytest.approx(1e-6)
+    assert rich.cache_read_input_token_cost == pytest.approx(3e-8)
+    assert rich.output_cost_per_reasoning_token == pytest.approx(2.5e-6)
+    # Plain model keeps the optional fields as None.
+    plain = table["plain-model"]
+    assert plain.input_cost_per_audio_token is None
+    assert plain.cache_read_input_token_cost is None
+    assert plain.output_cost_per_reasoning_token is None
 
 
 def test_canonical_strips_provider_prefix_and_variants():

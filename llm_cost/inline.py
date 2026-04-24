@@ -17,6 +17,7 @@ llm-replay so concurrent async library use doesn't leak enablement.
 
 from __future__ import annotations
 
+import json
 import os
 from contextvars import ContextVar
 
@@ -24,7 +25,7 @@ import click
 
 from . import pricing
 from .cli import format_money
-from .summary import canonical_key
+from .summary import canonical_key, parse_token_details
 
 _ENABLED: ContextVar[bool | None] = ContextVar("llm_cost_inline_enabled", default=None)
 
@@ -64,18 +65,22 @@ def format_cost_line(
     output_tokens: int,
     alias_map: dict[str, str] | None = None,
     prices: dict[str, pricing.Price] | None = None,
+    token_details: str | None = None,
 ) -> str:
     """Compute the cost and render the one-line display.
 
     Separated from the hook for testability — callers pass in the
-    alias map / price table explicitly.
+    alias map / price table explicitly. ``token_details`` (raw JSON from
+    the provider) lets us split the input into text/audio/cached so
+    Gemini audio calls don't under-price by 3–7×.
     """
     table = prices if prices is not None else pricing.default_prices()
     amap = alias_map if alias_map is not None else _alias_map()
     key = canonical_key(model_id, resolved_model, amap)
     price = pricing.resolve(key, None, table)
     if price is not None:
-        cost = price.cost(input_tokens, output_tokens)
+        breakdown = parse_token_details(token_details, input_tokens, output_tokens)
+        cost = price.cost_for(breakdown)
         source = "priced"
     else:
         cost = 0.0
@@ -97,6 +102,13 @@ def emit_cost_for_response(response) -> None:
     resolved = getattr(response, "resolved_model", None)
     inp = getattr(response, "input_tokens", None) or 0
     outp = getattr(response, "output_tokens", None) or 0
+    # Response.token_details is a dict on the in-memory object; the
+    # parser expects the JSON string shape stored in sqlite. Round-trip
+    # so the same helper works in both paths.
+    td_obj = getattr(response, "token_details", None)
+    token_details = json.dumps(td_obj) if td_obj else None
 
-    line = format_cost_line(model_id, resolved, int(inp), int(outp))
+    line = format_cost_line(
+        model_id, resolved, int(inp), int(outp), token_details=token_details
+    )
     click.echo(click.style(line, fg="yellow", bold=True), err=True)

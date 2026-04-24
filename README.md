@@ -126,12 +126,28 @@ For each canonical model group:
    plugin), that wins at the subgroup level.
 2. Otherwise the active price table is consulted. Rates are **per
    token** (matching LiteLLM's `model_prices_and_context_window.json`).
-   Input and output tokens are priced separately.
 3. When a canonical group spans subgroups with both logged and priced
    costs, the row shows `source=mixed` and the total is the per-subgroup
    sum so nothing drops out.
 4. Models that aren't in the price table and had no `cost_usd` logged
    are labelled `unpriced` and called out in a footnote.
+
+When llm's `responses.token_details` column is populated (Gemini via
+`llm-gemini` writes this automatically), input and output tokens are
+split into buckets and priced at the right rate:
+
+- **Audio input** at `input_cost_per_audio_token` — 3–7× the text rate
+  on Gemini 2.x models. Without this split, audio transcription costs
+  show up ~2× too low.
+- **Cached input** at `cache_read_input_token_cost` — roughly 10×
+  cheaper than fresh tokens. Without this split, cache hits show up
+  ~10× too expensive.
+- **Reasoning output** (Gemini's `thoughtsTokenCount`) at
+  `output_cost_per_reasoning_token` when a model publishes a distinct
+  rate; otherwise priced at the base output rate.
+
+Rows without `token_details` (OpenAI, Anthropic, older llm logs) fall
+back to plain text-only pricing.
 
 Model names are collapsed via `llm.get_model_aliases()` so historical
 variants of the same model (e.g. `gemini-3-flash-preview`,
